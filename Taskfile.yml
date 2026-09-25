@@ -10,4 +10,6 @@ tasks:
     cmds:
       - GOOS=linux GOARCH=amd64 go build -ldflags="-X main.Version={{.VERSION}}" -o pluck-linux-amd64 ./cmd/pluck/main.go
       - GOOS=windows GOARCH=amd64 go build -ldflags="-X main.Version={{.VERSION}}" -o pluck-windows-amd64.exe ./cmd/pluck/main.go
+      - GOOS=darwin GOARCH=amd64 go build -ldflags="-X main.Version={{.VERSION}}" -o pluck-darwin-amd64 ./cmd/pluck/main.go
+      - GOOS=darwin GOARCH=arm64 go build -ldflags="-X main.Version={{.VERSION}}" -o pluck-darwin-arm64 ./cmd/pluck/main.go
       - CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC=$NDK_BIN/aarch64-linux-android29-clang go build -ldflags="-X main.Version={{.VERSION}}" -o pluck-android-arm64 ./cmd/pluck/main.go
