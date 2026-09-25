@@ -1,8 +1,8 @@
 # Pixel Plucker
 
-Pixel Plucker is a cli utility that surgically extracts partitions and files out of remote Pixel factory image files without downloading the entire archive.
+Pixel Plucker is a cli utility that surgically extracts partitions and files out of remote Pixel factory images without downloading the entire archive.
 
-It works by reading zip and erofs structures with HTTP range requests then downloads the target file with the same. It supports deflate for extracting the images, but will not extract files from within compressed images.
+It works by reading zip and erofs structures with HTTP range requests then downloading the target file with the same. It supports deflate for extracting the images but will not extract files from within compressed images.
 
 ## Usage
 
