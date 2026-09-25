@@ -196,6 +196,8 @@ const (
 
 var emptyMagic [4]byte
 
+var Version = "development"
+
 //goland:noinspection GoUnhandledErrorResult
 func fetchRange(url string, offset uint64, end uint64, label string, client *http.Client) ([]byte, error) {
 	empty := make([]byte, 0, end-offset)
@@ -708,6 +710,10 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 
 //goland:noinspection GoUnhandledErrorResult
 func main() {
+	var version bool
+	flag.BoolVar(&version, "v", false, "")
+	flag.BoolVar(&version, "version", false, "")
+
 	var list bool
 	flag.BoolVar(&list, "l", false, "")
 	flag.BoolVar(&list, "list", false, "")
@@ -719,11 +725,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  partitionFilename  Name of the partition to download (optional)")
 		fmt.Fprintln(os.Stderr, "  filePath           Path to file in partition to download (optional)")
 		fmt.Fprintln(os.Stderr, "\nFlags:")
+		fmt.Fprintln(os.Stderr, "  -v, --version      Print version and exit")
 		fmt.Fprintln(os.Stderr, "  -l, --list         List filenames without downloading")
 	}
 
 	flag.Parse()
 	args := flag.Args()
+
+	if version {
+		fmt.Fprintf(os.Stderr, "pixel-plucker %s\n", Version)
+		os.Exit(0)
+	}
 
 	if len(args) < 1 && len(args) > 3 {
 		flag.Usage()

@@ -7,7 +7,7 @@ It works by reading zip and erofs structures with HTTP range requests then downl
 ## Usage
 
 ```text
-Usage: pluck [-l,--list] <factoryImageURL> [partitionFilename [filePath]]
+Usage: pluck [-v|--version] [-l|--list] <factoryImageURL> [partitionFilename [filePath]]
 ```
 
 ### Examples

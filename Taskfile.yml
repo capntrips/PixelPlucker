@@ -1,0 +1,13 @@
+version: '3'
+
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo "unknown"
+
+tasks:
+  build:
+    desc: Build the application with automatic Git versioning
+    cmds:
+      - GOOS=linux GOARCH=amd64 go build -ldflags="-X main.Version={{.VERSION}}" -o pluck-linux-amd64 ./cmd/pluck/main.go
+      - GOOS=windows GOARCH=amd64 go build -ldflags="-X main.Version={{.VERSION}}" -o pluck-windows-amd64.exe ./cmd/pluck/main.go
+      - CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC=$NDK_BIN/aarch64-linux-android29-clang go build -ldflags="-X main.Version={{.VERSION}}" -o pluck-android-arm64 ./cmd/pluck/main.go
