@@ -7,7 +7,17 @@ It works by reading zip, erofs, and avb structures with HTTP range requests then
 ## Usage
 
 ```text
-Usage: pluck [-v|--version] [-l|--list] [-a|--avb] <factoryImageURL> [partitionFilename [filePath]]
+Usage: ./pluck [flags] <factoryImageURL> [partitionFilename [filePath]]
+
+Arguments:
+  factoryImageURL    URL of the factory image
+  partitionFilename  Name of the partition to download (optional)
+  filePath           Path to file in partition to download (optional)
+
+Flags:
+  -v, --version      Print version and exit
+  -l, --list         List filenames
+  -a, --avb          List AVB props
 ```
 
 ### Examples
@@ -31,17 +41,17 @@ Download the `/system/build.prop` file from the `system.img` partition image in 
 
 12.24kb in 17 requests.
 ```bash
-pluck --avb https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip vbmeta_system.img
+pluck --avb https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip product.img
 ```
-List the AVB property descriptors from `vbmeta_system.img` partition image in the full factory image.
+List the AVB property descriptors from `product.img` partition image in the full factory image.
 
-16.96kb in 13 requests.
+13.74kb in 20 requests.
 ```bash
 pluck --avb https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip vbmeta_system.img
 ```
-Download the `init_boot.img` partition image from the full factory image to a temporary file and list the AVB property descriptors.
+Download the `vbmeta_system.img` partition image from the full factory image to a temporary file and list the AVB property descriptors.
 
-2.25mb in 13 requests.
+16.96kb in 13 requests.
 
 ## Note
 
