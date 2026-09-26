@@ -2,12 +2,12 @@
 
 Pixel Plucker is a cli utility that surgically extracts partitions and files out of remote Pixel factory images without downloading the entire archive.
 
-It works by reading zip and erofs structures with HTTP range requests then downloading the target file with the same. It supports deflate for extracting the images but will not extract files from within compressed images.
+It works by reading zip, erofs, and avb structures with HTTP range requests then downloading the target file with the same. It supports deflate for extracting the images but will not extract files from within compressed images.
 
 ## Usage
 
 ```text
-Usage: pluck [-v|--version] [-l|--list] <factoryImageURL> [partitionFilename [filePath]]
+Usage: pluck [-v|--version] [-l|--list] [-a|--avb] <factoryImageURL> [partitionFilename [filePath]]
 ```
 
 ### Examples
@@ -27,9 +27,21 @@ Download the `init_boot.img` partition image from the full factory image.
 ```bash
 pluck https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip system.img /system/build.prop
 ```
-Download the `/system/build.prop` file from  the `system.img` partition image in the full factory image.
+Download the `/system/build.prop` file from the `system.img` partition image in the full factory image.
 
 12.24kb in 17 requests.
+```bash
+pluck --avb https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip vbmeta_system.img
+```
+List the AVB property descriptors from `vbmeta_system.img` partition image in the full factory image.
+
+16.96kb in 13 requests.
+```bash
+pluck --avb https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip vbmeta_system.img
+```
+Download the `init_boot.img` partition image from the full factory image to a temporary file and list the AVB property descriptors.
+
+2.25mb in 13 requests.
 
 ## Note
 

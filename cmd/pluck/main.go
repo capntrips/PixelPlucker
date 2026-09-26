@@ -166,18 +166,73 @@ type ErofsInodeChunkIndex struct {
 	StartBlkLo uint32
 }
 
+// https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_footer.h
+
+type AvbFooter struct {
+	Magic             [4]byte
+	VersionMajor      uint32
+	VersionMinor      uint32
+	OriginalImageSize uint64
+	VBMetaOffset      uint64
+	VBMetaSize        uint64
+	Reserved          [28]byte
+}
+
+// https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_vbmeta_image.h
+
+type AvbVBMetaImageHeader struct {
+	Magic                       [4]byte
+	RequiredLibavbVersionMajor  uint32
+	RequiredLibavbVersionMinor  uint32
+	AuthenticationDataBlockSize uint64
+	AuxiliaryDataBlockSize      uint64
+	AlgorithmType               uint32
+	HashOffset                  uint64
+	HashSize                    uint64
+	SignatureOffset             uint64
+	SignatureSize               uint64
+	PublicKeyOffset             uint64
+	PublicKeySize               uint64
+	PublicKeyMetadataOffset     uint64
+	PublicKeyMetadataSize       uint64
+	DescriptorsOffset           uint64
+	DescriptorsSize             uint64
+	RollbackIndex               uint64
+	Flags                       uint32
+	RollbackIndexLocation       uint32
+	ReleaseString               [48]byte
+	Reserved                    [80]byte
+}
+
+// https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_descriptor.h
+
+type AvbDescriptorHeader struct {
+	Tag               uint64
+	NumBytesFollowing uint64
+}
+
+// https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_property_descriptor.h
+
+type AvbPropertyDescriptor struct {
+	ParentDescriptor AvbDescriptorHeader
+	KeyNumBytes      uint64
+	ValueNumBytes    uint64
+}
+
 type MagicProvider interface {
 	GetMagic() [4]byte
 }
 
-func (h LocalFileHeader) GetMagic() [4]byte  { return h.Magic }
-func (h CdFileHeader) GetMagic() [4]byte     { return h.Magic }
-func (r EocdRecord) GetMagic() [4]byte       { return r.Magic }
-func (l Zip64EocdLocator) GetMagic() [4]byte { return l.Magic }
-func (r Zip64EocdRecord) GetMagic() [4]byte  { return r.Magic }
-func (s ErofsSuperblock) GetMagic() [4]byte  { return s.Magic }
-func (s SparseStub) GetMagic() [4]byte       { return s.Magic }
-func (s ErofsStub) GetMagic() [4]byte        { return s.Magic }
+func (h LocalFileHeader) GetMagic() [4]byte      { return h.Magic }
+func (h CdFileHeader) GetMagic() [4]byte         { return h.Magic }
+func (r EocdRecord) GetMagic() [4]byte           { return r.Magic }
+func (l Zip64EocdLocator) GetMagic() [4]byte     { return l.Magic }
+func (r Zip64EocdRecord) GetMagic() [4]byte      { return r.Magic }
+func (s ErofsSuperblock) GetMagic() [4]byte      { return s.Magic }
+func (s SparseStub) GetMagic() [4]byte           { return s.Magic }
+func (s ErofsStub) GetMagic() [4]byte            { return s.Magic }
+func (a AvbFooter) GetMagic() [4]byte            { return a.Magic }
+func (a AvbVBMetaImageHeader) GetMagic() [4]byte { return a.Magic }
 
 const (
 	ChunkSize = 16384
@@ -192,6 +247,16 @@ const (
 
 	ErofsINodeFlatPlain  = 0
 	ErofsIDatalayoutMask = uint16(0x07)
+
+	// https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_vbmeta_image.h
+	// https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_footer.h
+	// https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_descriptor.h
+
+	AvbMagic                 = "AVB0"
+	AvbVBMetaImageHeaderSize = 256
+	AvbFooterMagic           = "AVBf"
+	AvbFooterSize            = 64
+	AvbDescriptorTagProperty = 0
 )
 
 var emptyMagic [4]byte
@@ -222,7 +287,7 @@ func fetchRange(url string, offset uint64, end uint64, label string, client *htt
 	return buf, nil
 }
 
-func fetchStruct(url string, offset uint64, target any, label string, magic [4]byte, client *http.Client) error {
+func fetchStruct(url string, offset uint64, target any, label string, magic [4]byte, order binary.ByteOrder, client *http.Client) error {
 	sizeofStruct := binary.Size(target)
 	end := offset + uint64(sizeofStruct) - 1
 
@@ -231,12 +296,12 @@ func fetchStruct(url string, offset uint64, target any, label string, magic [4]b
 		return err
 	}
 
-	return readStruct(buf, 0, target, label, magic)
+	return readStruct(buf, 0, target, label, magic, order)
 }
 
-func readStruct(buf []byte, offset uint64, target any, label string, magic [4]byte) error {
+func readStruct(buf []byte, offset uint64, target any, label string, magic [4]byte, order binary.ByteOrder) error {
 	reader := bytes.NewReader(buf[offset:])
-	if err := binary.Read(reader, binary.LittleEndian, target); err != nil {
+	if err := binary.Read(reader, order, target); err != nil {
 		return fmt.Errorf("%s: failed to parse data: %w", label, err)
 	}
 
@@ -254,7 +319,7 @@ func readStruct(buf []byte, offset uint64, target any, label string, magic [4]by
 }
 
 //goland:noinspection GoUnhandledErrorResult
-func fetchFileZip(url string, offset uint64, end uint64, uncompressedSize uint64, partitionFilename string, compressionMethod uint16, client *http.Client) (uint32, error) {
+func fetchFileZip(url string, offset uint64, end uint64, uncompressedSize uint64, partitionFilename string, targetFilename string, compressionMethod uint16, client *http.Client) (uint32, error) {
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, end))
 
@@ -271,7 +336,10 @@ func fetchFileZip(url string, offset uint64, end uint64, uncompressedSize uint64
 		return 0, fmt.Errorf("partition image: GET request rejected with status: %s", res.Status)
 	}
 
-	out, err := os.Create(partitionFilename)
+	if targetFilename == "" {
+		targetFilename = partitionFilename
+	}
+	out, err := os.Create(targetFilename)
 	if err != nil {
 		fmt.Println()
 		return 0, fmt.Errorf("partition image: failed to create local partition image: %v", err)
@@ -340,7 +408,7 @@ func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, de
 			nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + dirent.Nid*32
 
 			var inode ErofsInodeExtended
-			if err = fetchStruct(url, offset+nidOffset, &inode, "extended inode", emptyMagic, client); err != nil {
+			if err = fetchStruct(url, offset+nidOffset, &inode, "extended inode", emptyMagic, binary.LittleEndian, client); err != nil {
 				return err
 			}
 
@@ -352,7 +420,7 @@ func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, de
 			sizeofInode := uint64(binary.Size(inode))
 			chunkIndexOffset := offset + nidOffset + sizeofInode
 			var chunkIndex ErofsInodeChunkIndex
-			if err = fetchStruct(url, chunkIndexOffset, &chunkIndex, "chunk index", emptyMagic, client); err != nil {
+			if err = fetchStruct(url, chunkIndexOffset, &chunkIndex, "chunk index", emptyMagic, binary.LittleEndian, client); err != nil {
 				return err
 			}
 
@@ -419,7 +487,7 @@ func fetchInodeDirents(nid uint64, url string, offset uint64, superblock ErofsSu
 	nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + nid*32
 
 	var inode ErofsInodeExtended
-	if err := fetchStruct(url, offset+nidOffset, &inode, "extended inode", emptyMagic, client); err != nil {
+	if err := fetchStruct(url, offset+nidOffset, &inode, "extended inode", emptyMagic, binary.LittleEndian, client); err != nil {
 		return nil, err
 	}
 
@@ -433,7 +501,7 @@ func fetchInodeDirents(nid uint64, url string, offset uint64, superblock ErofsSu
 	fileMap := make(map[string]ErofsDirent)
 
 	var dirent ErofsDirent
-	err = readStruct(buf, 0, &dirent, "dirent", emptyMagic)
+	err = readStruct(buf, 0, &dirent, "dirent", emptyMagic, binary.LittleEndian)
 	if err != nil {
 		return nil, fmt.Errorf("dirents: failed to read initial dirent: %w", err)
 	}
@@ -445,7 +513,7 @@ func fetchInodeDirents(nid uint64, url string, offset uint64, superblock ErofsSu
 
 	dirents := make([]ErofsDirent, numEntries)
 	for i := range numEntries {
-		err = readStruct(buf, uint64(i*12), &dirent, "dirent", emptyMagic)
+		err = readStruct(buf, uint64(i*12), &dirent, "dirent", emptyMagic, binary.LittleEndian)
 		if err != nil {
 			return nil, fmt.Errorf("dirents: failed to read dirent at index %d: %w", i, err)
 		}
@@ -471,8 +539,41 @@ func fetchInodeDirents(nid uint64, url string, offset uint64, superblock ErofsSu
 	return fileMap, nil
 }
 
+func printAvbPropertyDescriptors(buf []byte, avbHeader AvbVBMetaImageHeader) error {
+	var avbDescriptor AvbDescriptorHeader
+	var avbPropertyDescriptor AvbPropertyDescriptor
+	sizeofAvbDescriptor := binary.Size(avbDescriptor)
+	sizeofAvbPropertyDescriptor := uint64(binary.Size(avbPropertyDescriptor))
+
+	var offset = AvbVBMetaImageHeaderSize + avbHeader.AuthenticationDataBlockSize + avbHeader.DescriptorsOffset
+	var descriptorsEnd = offset + avbHeader.DescriptorsSize
+	for offset < descriptorsEnd {
+		err := readStruct(buf, offset, &avbDescriptor, "avb descriptor", emptyMagic, binary.BigEndian)
+		if err != nil {
+			return fmt.Errorf("file path: failed to read avb descriptor: %w", err)
+		}
+
+		if avbDescriptor.Tag == AvbDescriptorTagProperty {
+			err = readStruct(buf, offset, &avbPropertyDescriptor, "avb property descriptor", emptyMagic, binary.BigEndian)
+			if err != nil {
+				return fmt.Errorf("file path: failed to read avb property descriptor: %w", err)
+			}
+			keyOffset := offset + sizeofAvbPropertyDescriptor
+			keyEnd := keyOffset + avbPropertyDescriptor.KeyNumBytes
+			valueOffset := keyEnd + 1
+			valueEnd := valueOffset + avbPropertyDescriptor.ValueNumBytes
+			key := string(buf[keyOffset:keyEnd])
+			value := string(buf[valueOffset:valueEnd])
+			fmt.Printf("%s=%s\n", key, value)
+		}
+
+		offset += uint64(sizeofAvbDescriptor) + avbDescriptor.NumBytesFollowing
+	}
+	return nil
+}
+
 //goland:noinspection GoUnhandledErrorResult
-func findAndReadCentralDirectory(url string, partitionFilename string, filePath string, list bool, sofOffset uint64, eofOffset uint64) error {
+func findAndReadCentralDirectory(url string, partitionFilename string, filePath string, list bool, avb bool, sofOffset uint64, eofOffset uint64) error {
 	var eocdHeader EocdRecord
 	var eocd64locator Zip64EocdLocator
 	var eocd64record Zip64EocdRecord
@@ -490,17 +591,23 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 	}
 
 	eocdIdx := uint64(sizeofEocd64record + sizeofEocd64locator)
-	err = readStruct(eocdBuf, eocdIdx, &eocdHeader, "end of central directory", [4]byte{'P', 'K', 0x05, 0x06})
+	err = readStruct(eocdBuf, eocdIdx, &eocdHeader, "end of central directory", [4]byte{'P', 'K', 0x05, 0x06}, binary.LittleEndian)
 	if err != nil {
-		return err
+		eocdOffset -= 3998
+		eocdBuf, err = fetchRange(url, eocdOffset, eofOffset-1, "end of central directory", client)
+		eocdIdx = uint64(bytes.LastIndex(eocdBuf, []byte{'P', 'K', 0x05, 0x06}))
+		err2 := readStruct(eocdBuf, eocdIdx, &eocdHeader, "end of central directory", [4]byte{'P', 'K', 0x05, 0x06}, binary.LittleEndian)
+		if err2 != nil {
+			return err
+		}
 	}
 
 	cdOffset := uint64(eocdHeader.CdOffset)
 	cdSize := uint64(eocdHeader.CdSize)
 
 	if eocdHeader.CdOffset == 0xFFFFFFFF {
-		eocd64recordIdx := uint64(0)
-		err = readStruct(eocdBuf, eocd64recordIdx, &eocd64record, "zip64 end of central directory record", [4]byte{'P', 'K', 0x06, 0x06})
+		eocd64recordIdx := eocdIdx - uint64(sizeofEocd64record+sizeofEocd64locator)
+		err = readStruct(eocdBuf, eocd64recordIdx, &eocd64record, "zip64 end of central directory record", [4]byte{'P', 'K', 0x06, 0x06}, binary.LittleEndian)
 		if err != nil {
 			return err
 		}
@@ -530,7 +637,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 			return fmt.Errorf("central directory: unexpected end of buffer")
 		}
 
-		err = readStruct(cdBuf, offset, &cdfHeader, "central directory file header", [4]byte{'P', 'K', 0x01, 0x02})
+		err = readStruct(cdBuf, offset, &cdfHeader, "central directory file header", [4]byte{'P', 'K', 0x01, 0x02}, binary.LittleEndian)
 		if err != nil {
 			return err
 		}
@@ -600,7 +707,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 			fmt.Printf("%s%s | Offset: %d | Size: %d%s | Compression: %d\n", prefix, filename, lfhOffset, compressedSize, compressedSizeHuman, cdfHeader.CompressionMethod)
 		}
 		if nestedZipRegex.MatchString(filename) || (partitionFilename != "" && partitionRegex.MatchString(filename)) {
-			err = fetchStruct(url, sofOffset+lfhOffset, &lfHeader, "local file header", [4]byte{'P', 'K', 0x03, 0x04}, client)
+			err = fetchStruct(url, sofOffset+lfhOffset, &lfHeader, "local file header", [4]byte{'P', 'K', 0x03, 0x04}, binary.LittleEndian, client)
 			if err != nil {
 				return err
 			}
@@ -612,7 +719,11 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 
 			//goland:noinspection GoRedundantElseInIf
 			if nestedZipRegex.MatchString(filename) {
-				return findAndReadCentralDirectory(url, partitionFilename, filePath, list, lfOffset, lfOffset+compressedSize)
+				if err = findAndReadCentralDirectory(url, partitionFilename, filePath, list, avb, lfOffset, lfOffset+compressedSize); err != nil {
+					return err
+				} else if !list {
+					return nil
+				}
 			} else {
 				//goland:noinspection GoRedundantElseInIf
 				if filePath != "" {
@@ -627,8 +738,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 					var sparseStub SparseStub
 					var sparseMagic [4]byte
 					binary.LittleEndian.PutUint32(sparseMagic[:], 0xed26ff3a)
-					imageOffset := sofOffset + lfhOffset + sizeofLfHeader + n + m
-					err = fetchStruct(url, imageOffset, &sparseStub, "sparse stub", sparseMagic, client)
+					err = fetchStruct(url, lfOffset, &sparseStub, "sparse stub", sparseMagic, binary.LittleEndian, client)
 					if err == nil {
 						return fmt.Errorf("partition: sparse image format is not currently supported")
 					}
@@ -636,13 +746,13 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 					var erofsStub ErofsStub
 					var erofsMagic [4]byte
 					binary.LittleEndian.PutUint32(erofsMagic[:], 0xe0f5e1e2)
-					erofsOffset := imageOffset + 0x400
-					err = fetchStruct(url, erofsOffset, &erofsStub, "erofs stub", erofsMagic, client)
+					erofsOffset := lfOffset + 0x400
+					err = fetchStruct(url, erofsOffset, &erofsStub, "erofs stub", erofsMagic, binary.LittleEndian, client)
 
 					//goland:noinspection GoRedundantElseInIf
 					if err == nil {
 						var superblock ErofsSuperblock
-						err = fetchStruct(url, erofsOffset, &superblock, "erofs superblock", erofsMagic, client)
+						err = fetchStruct(url, erofsOffset, &superblock, "erofs superblock", erofsMagic, binary.LittleEndian, client)
 						if err != nil {
 							return err
 						}
@@ -651,7 +761,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 						nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + uint64(superblock.RootNid)*32
 
 						var formatBits uint16
-						buf, err := fetchRange(url, imageOffset+nidOffset, imageOffset+nidOffset+1, "inode format check", client)
+						buf, err := fetchRange(url, lfOffset+nidOffset, lfOffset+nidOffset+1, "inode format check", client)
 						if err != nil {
 							return err
 						}
@@ -674,20 +784,120 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 							filePath = filepath.Dir(filePath)
 						}
 
-						return fetchFileErofs(url, imageOffset, uint64(superblock.RootNid), filePathParts, 0, superblock, client)
+						return fetchFileErofs(url, lfOffset, uint64(superblock.RootNid), filePathParts, 0, superblock, client)
 					} else {
 						return fmt.Errorf("ext4 format is not currently supported")
 					}
 				} else {
-					hash, err := fetchFileZip(url, lfOffset, lfOffset+compressedSize-1, uncompressedSize, partitionFilename, cdfHeader.CompressionMethod, client)
-					if err != nil {
-						return err
-					}
-					if hash != cdfHeader.CRC32 {
-						os.Remove(partitionFilename)
-						return fmt.Errorf("central directory: hash mismatch")
+					if cdfHeader.CompressionMethod == 8 || !avb {
+						// allows defer in a loop
+						return func() error {
+							var targetFilename string
+							if avb {
+								tmpFile, err := os.CreateTemp("", "pixel-plucker-*.img")
+								if err != nil {
+									return fmt.Errorf("central directory: failed to create temp file: %w", err)
+								}
+								targetFilename = tmpFile.Name()
+								tmpFile.Close()
+								defer os.Remove(targetFilename)
+							}
+
+							hash, err := fetchFileZip(url, lfOffset, lfOffset+compressedSize-1, uncompressedSize, partitionFilename, targetFilename, cdfHeader.CompressionMethod, client)
+							if err != nil {
+								return err
+							}
+							if hash != cdfHeader.CRC32 {
+								os.Remove(partitionFilename)
+								return fmt.Errorf("central directory: hash mismatch")
+							} else if avb {
+								partition, err := os.Open(targetFilename)
+								if err != nil {
+									return fmt.Errorf("partition: failed to open for reading: %w", err)
+								}
+
+								avbHeaderBuf := make([]byte, AvbVBMetaImageHeaderSize)
+								if _, err := io.ReadFull(partition, avbHeaderBuf); err != nil {
+									return fmt.Errorf("partition: failed to read avb header: %w", err)
+								}
+
+								var avbHeader AvbVBMetaImageHeader
+								var avbHeaderMagic [4]byte
+								copy(avbHeaderMagic[:], AvbMagic)
+								err = readStruct(avbHeaderBuf, 0, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian)
+								if err != nil {
+									_, err = partition.Seek(-AvbFooterSize, io.SeekEnd)
+									if err != nil {
+										return fmt.Errorf("partition: failed to seek to avb footer: %w", err)
+									}
+
+									footerBuf := make([]byte, AvbFooterSize)
+									if _, err := io.ReadFull(partition, footerBuf); err != nil {
+										return fmt.Errorf("partition: failed to read avb footer: %w", err)
+									}
+
+									var avbFooterMagic [4]byte
+									copy(avbFooterMagic[:], AvbFooterMagic)
+
+									var avbFooter AvbFooter
+									err = readStruct(footerBuf, 0, &avbFooter, "avb footer", avbFooterMagic, binary.BigEndian)
+									if err != nil {
+										return err
+									}
+
+									partition.Seek(int64(avbFooter.VBMetaOffset), io.SeekStart)
+									if _, err := io.ReadFull(partition, avbHeaderBuf); err != nil {
+										return fmt.Errorf("partition: failed to read avb header: %w", err)
+									}
+
+									err = readStruct(avbHeaderBuf, 0, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian)
+									if err != nil {
+										return err
+									}
+
+									partition.Seek(int64(avbFooter.VBMetaOffset), io.SeekStart)
+								} else {
+									partition.Seek(0, io.SeekStart)
+								}
+
+								avbBuf := make([]byte, AvbVBMetaImageHeaderSize+avbHeader.AuthenticationDataBlockSize+avbHeader.AuxiliaryDataBlockSize)
+								if _, err := io.ReadFull(partition, avbBuf); err != nil {
+									return fmt.Errorf("partition: failed to read avb header: %w", err)
+								}
+								return printAvbPropertyDescriptors(avbBuf, avbHeader)
+							}
+
+							return nil
+						}()
 					} else {
-						return nil
+						var avbHeader AvbVBMetaImageHeader
+						var avbHeaderMagic [4]byte
+						copy(avbHeaderMagic[:], AvbMagic)
+						avbOffset := lfOffset
+						err = fetchStruct(url, avbOffset, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian, client)
+						if err != nil {
+							var avbFooter AvbFooter
+							var avbFooterMagic [4]byte
+							copy(avbFooterMagic[:], AvbFooterMagic)
+							footerOffset := lfOffset + compressedSize - 64
+							err = fetchStruct(url, footerOffset, &avbFooter, "avb footer", avbFooterMagic, binary.BigEndian, client)
+							if err != nil {
+								return err
+							}
+
+							avbOffset = lfOffset + avbFooter.VBMetaOffset
+
+							err = fetchStruct(url, avbOffset, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian, client)
+							if err != nil {
+								return err
+							}
+						}
+
+						avbBuf, err := fetchRange(url, avbOffset, avbOffset+AvbVBMetaImageHeaderSize+avbHeader.AuthenticationDataBlockSize+avbHeader.AuxiliaryDataBlockSize, "avb header", client)
+						if err != nil {
+							return err
+						}
+						return printAvbPropertyDescriptors(avbBuf, avbHeader)
 					}
 				}
 			}
@@ -718,6 +928,10 @@ func main() {
 	flag.BoolVar(&list, "l", false, "")
 	flag.BoolVar(&list, "list", false, "")
 
+	var avb bool
+	flag.BoolVar(&avb, "a", false, "")
+	flag.BoolVar(&avb, "avb", false, "")
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <factoryImageURL> [partitionFilename [filePath]]\n\n", os.Args[0])
 		fmt.Fprintln(os.Stderr, "Arguments:")
@@ -726,23 +940,39 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  filePath           Path to file in partition to download (optional)")
 		fmt.Fprintln(os.Stderr, "\nFlags:")
 		fmt.Fprintln(os.Stderr, "  -v, --version      Print version and exit")
-		fmt.Fprintln(os.Stderr, "  -l, --list         List filenames without downloading")
+		fmt.Fprintln(os.Stderr, "  -l, --list         List filenames")
+		fmt.Fprintln(os.Stderr, "  -a, --avb          List AVB props")
 	}
 
 	flag.Parse()
 	args := flag.Args()
 
 	if version {
-		fmt.Fprintf(os.Stderr, "pixel-plucker %s\n", Version)
+		fmt.Fprintf(os.Stderr, "pluck %s\n", Version)
 		os.Exit(0)
 	}
 
+	if list && avb {
+		fmt.Fprintln(os.Stderr, "Error: list and avb are not compatible")
+		flag.Usage()
+		os.Exit(1)
+	}
 	if len(args) < 1 && len(args) > 3 {
 		flag.Usage()
 		os.Exit(1)
 	}
 	if !list && len(args) < 2 {
 		fmt.Fprintln(os.Stderr, "Error: partitionFilename is required when list flag is not provided")
+		flag.Usage()
+		os.Exit(1)
+	}
+	if avb && len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "Error: partitionFilename is required when avb flag is provided")
+		flag.Usage()
+		os.Exit(1)
+	}
+	if avb && len(args) == 3 {
+		fmt.Fprintln(os.Stderr, "Error: filePath and avb are not compatible")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -776,7 +1006,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	err = findAndReadCentralDirectory(url, partitionFilename, filePath, list, 0, uint64(contentLength))
+	err = findAndReadCentralDirectory(url, partitionFilename, filePath, list, avb, 0, uint64(contentLength))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
