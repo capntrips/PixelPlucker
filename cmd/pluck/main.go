@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"hash/crc32"
@@ -234,6 +235,88 @@ func (s ErofsStub) GetMagic() [4]byte            { return s.Magic }
 func (a AvbFooter) GetMagic() [4]byte            { return a.Magic }
 func (a AvbVBMetaImageHeader) GetMagic() [4]byte { return a.Magic }
 
+type Image interface {
+	io.ReaderAt
+	io.ReadCloser
+	OpenStream(offset, end uint64) (io.ReadCloser, error)
+}
+
+type RemoteImage struct {
+	url    string
+	client *http.Client
+	offset int64
+}
+
+func (r *RemoteImage) ReadAt(p []byte, off int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	req, _ := http.NewRequest("GET", r.url, nil)
+	end := off + int64(len(p)) - 1
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end))
+
+	res, err := r.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	//goland:noinspection GoUnhandledErrorResult
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusPartialContent {
+		return 0, fmt.Errorf("unexpected HTTP status: %s", res.Status)
+	}
+
+	return io.ReadFull(res.Body, p)
+}
+
+func (r *RemoteImage) Read(p []byte) (int, error) {
+	n, err := r.ReadAt(p, r.offset)
+	r.offset += int64(n)
+	return n, err
+}
+
+func (r *RemoteImage) Close() error {
+	return nil
+}
+
+func (r *RemoteImage) OpenStream(offset, end uint64) (io.ReadCloser, error) {
+	req, _ := http.NewRequest("GET", r.url, nil)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, end))
+
+	res, err := r.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET request failed: %w", err)
+	}
+	if res.StatusCode != http.StatusPartialContent {
+		//goland:noinspection GoUnhandledErrorResult
+		res.Body.Close()
+		return nil, fmt.Errorf("GET request rejected with status: %s", res.Status)
+	}
+
+	return res.Body, nil
+}
+
+type LocalImage struct {
+	file *os.File
+}
+
+func (l *LocalImage) ReadAt(p []byte, off int64) (int, error) {
+	return l.file.ReadAt(p, off)
+}
+
+func (l *LocalImage) Read(p []byte) (int, error) {
+	return l.file.Read(p)
+}
+
+func (l *LocalImage) Close() error {
+	return l.file.Close()
+}
+
+func (l *LocalImage) OpenStream(offset, end uint64) (io.ReadCloser, error) {
+	length := int64(end - offset + 1)
+	return io.NopCloser(io.NewSectionReader(l.file, int64(offset), length)), nil
+}
+
 const (
 	ChunkSize = 16384
 
@@ -266,34 +349,21 @@ var emptyMagic [4]byte
 var Version = "development"
 
 //goland:noinspection GoUnhandledErrorResult
-func fetchRange(url string, offset uint64, end uint64, label string, client *http.Client) ([]byte, error) {
-	empty := make([]byte, 0, end-offset)
-
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, end))
-	res, err := client.Do(req)
-	if err != nil {
-		return empty, fmt.Errorf("%s: GET request failed: %w", label, err)
+func fetchRange(src Image, offset uint64, end uint64, label string) ([]byte, error) {
+	size := int(end - offset + 1)
+	buf := make([]byte, size)
+	n, err := src.ReadAt(buf, int64(offset))
+	if err != nil && (!errors.Is(err, io.EOF) || n != size) {
+		return nil, err
 	}
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusPartialContent {
-		return empty, fmt.Errorf("%s: GET request rejected with status: %s", label, res.Status)
-	}
-
-	buf, err := io.ReadAll(res.Body)
-	if err != nil {
-		return empty, fmt.Errorf("%s: failed to read response: %w", label, err)
-	}
-
 	return buf, nil
 }
 
-func fetchStruct(url string, offset uint64, target any, label string, magic [4]byte, order binary.ByteOrder, client *http.Client) error {
+func fetchStruct(src Image, offset uint64, target any, label string, magic [4]byte, order binary.ByteOrder) error {
 	sizeofStruct := binary.Size(target)
 	end := offset + uint64(sizeofStruct) - 1
 
-	buf, err := fetchRange(url, offset, end, label, client)
+	buf, err := fetchRange(src, offset, end, label)
 	if err != nil {
 		return err
 	}
@@ -321,22 +391,14 @@ func readStruct(buf []byte, offset uint64, target any, label string, magic [4]by
 }
 
 //goland:noinspection GoUnhandledErrorResult
-func fetchFileZip(url string, offset uint64, end uint64, uncompressedSize uint64, partitionFilename string, targetFilename string, compressionMethod uint16, client *http.Client) (uint32, error) {
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, end))
-
-	fmt.Print("partition image: downloading file ...")
-	res, err := client.Do(req)
+func fetchFileZip(src Image, offset uint64, end uint64, uncompressedSize uint64, partitionFilename string, targetFilename string, compressionMethod uint16) (uint32, error) {
+	stream, err := src.OpenStream(offset, end)
 	if err != nil {
-		fmt.Println()
-		return 0, fmt.Errorf("partition image: GET request failed: %v", err)
+		return 0, err
 	}
-	defer res.Body.Close()
+	defer stream.Close()
 
-	if res.StatusCode != http.StatusPartialContent {
-		fmt.Println()
-		return 0, fmt.Errorf("partition image: GET request rejected with status: %s", res.Status)
-	}
+	fmt.Print("partition image: streaming file ...")
 
 	if targetFilename == "" {
 		targetFilename = partitionFilename
@@ -348,9 +410,9 @@ func fetchFileZip(url string, offset uint64, end uint64, uncompressedSize uint64
 	}
 	defer out.Close()
 
-	var dataReader io.Reader = res.Body
+	var dataReader io.Reader = stream
 	if compressionMethod == 8 {
-		flateReader := flate.NewReader(res.Body)
+		flateReader := flate.NewReader(stream)
 		defer flateReader.Close()
 		dataReader = flateReader
 	}
@@ -378,17 +440,17 @@ func fetchFileZip(url string, offset uint64, end uint64, uncompressedSize uint64
 		}
 		if readErr != nil {
 			fmt.Println()
-			return 0, fmt.Errorf("partition image: GET request block read error: %v", readErr)
+			return 0, fmt.Errorf("partition image: block read error: %v", readErr)
 		}
 	}
 
-	fmt.Println("\r\033[2Kpartition image: successfully downloaded")
+	fmt.Println("\r\033[2Kpartition image: successfully written")
 
 	return hash.Sum32(), nil
 }
 
-func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, depth int, superblock ErofsSuperblock, client *http.Client) error {
-	dirents, err := fetchInodeDirents(nid, url, offset, superblock, client)
+func fetchFileErofs(image Image, offset uint64, nid uint64, filePath []string, depth int, superblock ErofsSuperblock) error {
+	dirents, err := fetchInodeDirents(nid, image, offset, superblock)
 	if err != nil {
 		return err
 	}
@@ -401,7 +463,7 @@ func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, de
 			} else if dirent.FileType != ErofsFtDir {
 				return fmt.Errorf("erofs: expected dir but got unexpected type: %d", dirent.FileType)
 			}
-			return fetchFileErofs(url, offset, dirent.Nid, filePath, depth+1, superblock, client)
+			return fetchFileErofs(image, offset, dirent.Nid, filePath, depth+1, superblock)
 		} else {
 			if dirent.FileType != ErofsFtRegFile {
 				return fmt.Errorf("erofs: unexpected file but got unexpected type: %d", dirent.FileType)
@@ -410,7 +472,7 @@ func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, de
 			nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + dirent.Nid*SizeofErofsInodeCompact
 
 			var inode ErofsInodeExtended
-			if err = fetchStruct(url, offset+nidOffset, &inode, "extended inode", emptyMagic, binary.LittleEndian, client); err != nil {
+			if err = fetchStruct(image, offset+nidOffset, &inode, "extended inode", emptyMagic, binary.LittleEndian); err != nil {
 				return err
 			}
 
@@ -422,27 +484,18 @@ func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, de
 			sizeofInode := uint64(binary.Size(inode))
 			chunkIndexOffset := offset + nidOffset + sizeofInode
 			var chunkIndex ErofsInodeChunkIndex
-			if err = fetchStruct(url, chunkIndexOffset, &chunkIndex, "chunk index", emptyMagic, binary.LittleEndian, client); err != nil {
+			if err = fetchStruct(image, chunkIndexOffset, &chunkIndex, "chunk index", emptyMagic, binary.LittleEndian); err != nil {
 				return err
 			}
 
 			fileOffset := offset + uint64(chunkIndex.StartBlkHi)*blockSize
-
-			req, _ := http.NewRequest("GET", url, nil)
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", fileOffset, fileOffset+inode.Size-1))
-
-			fmt.Print("file path: downloading file ...")
-			res, err := client.Do(req)
+			stream, err := image.OpenStream(fileOffset, fileOffset+inode.Size-1)
 			if err != nil {
-				fmt.Println()
-				return fmt.Errorf("file path: GET request failed: %v", err)
+				return err
 			}
-			defer res.Body.Close()
+			defer stream.Close()
 
-			if res.StatusCode != http.StatusPartialContent {
-				fmt.Println()
-				return fmt.Errorf("file path: GET request rejected with status: %s", res.Status)
-			}
+			fmt.Print("file path: streaming file ...")
 
 			out, err := os.Create(filePath[depth])
 			if err != nil {
@@ -455,7 +508,7 @@ func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, de
 			var totalWritten int64 = 0
 
 			for {
-				bytesRead, readErr := res.Body.Read(chunk)
+				bytesRead, readErr := stream.Read(chunk)
 				if bytesRead > 0 {
 					bytesWritten, writeErr := out.Write(chunk[:bytesRead])
 					if writeErr != nil {
@@ -470,11 +523,11 @@ func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, de
 				}
 				if readErr != nil {
 					fmt.Println()
-					return fmt.Errorf("file path: GET request block read error: %v", readErr)
+					return fmt.Errorf("file path: block read error: %v", readErr)
 				}
 			}
 
-			fmt.Println("\r\033[2Kfile path: successfully downloaded")
+			fmt.Println("\r\033[2Kfile path: successfully written")
 
 			return nil
 		}
@@ -484,18 +537,18 @@ func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, de
 }
 
 //goland:noinspection GoUnhandledErrorResult
-func fetchInodeDirents(nid uint64, url string, offset uint64, superblock ErofsSuperblock, client *http.Client) (map[string]ErofsDirent, error) {
+func fetchInodeDirents(nid uint64, image Image, offset uint64, superblock ErofsSuperblock) (map[string]ErofsDirent, error) {
 	blockSize := uint64(1) << superblock.BlkSizeBits
 	nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + nid*SizeofErofsInodeCompact
 
 	var inode ErofsInodeExtended
-	if err := fetchStruct(url, offset+nidOffset, &inode, "extended inode", emptyMagic, binary.LittleEndian, client); err != nil {
+	if err := fetchStruct(image, offset+nidOffset, &inode, "extended inode", emptyMagic, binary.LittleEndian); err != nil {
 		return nil, err
 	}
 
 	sizeofInode := uint64(binary.Size(inode))
 	direntOffset := offset + nidOffset + sizeofInode
-	buf, err := fetchRange(url, direntOffset, direntOffset+inode.Size, "dirents", client)
+	buf, err := fetchRange(image, direntOffset, direntOffset+inode.Size-1, "dirents")
 	if err != nil {
 		return nil, err
 	}
@@ -574,8 +627,39 @@ func printAvbPropertyDescriptors(buf []byte, avbHeader AvbVBMetaImageHeader) err
 	return nil
 }
 
+func findAndPrintAvbPropertyDescriptors(image Image, offset uint64, size uint64) error {
+	var avbHeader AvbVBMetaImageHeader
+	var avbHeaderMagic [4]byte
+	copy(avbHeaderMagic[:], AvbMagic)
+	err := fetchStruct(image, offset, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian)
+	if err != nil {
+		var avbFooter AvbFooter
+		var avbFooterMagic [4]byte
+		copy(avbFooterMagic[:], AvbFooterMagic)
+		footerOffset := offset + size - AvbFooterSize
+		err = fetchStruct(image, footerOffset, &avbFooter, "avb footer", avbFooterMagic, binary.BigEndian)
+		if err != nil {
+			return err
+		}
+
+		offset += avbFooter.VBMetaOffset
+
+		err = fetchStruct(image, offset, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian)
+		if err != nil {
+			return err
+		}
+	}
+
+	avbBuf, err := fetchRange(image, offset, offset+AvbVBMetaImageHeaderSize+avbHeader.AuthenticationDataBlockSize+avbHeader.AuxiliaryDataBlockSize-1, "avb header")
+	if err != nil {
+		return err
+	}
+	return printAvbPropertyDescriptors(avbBuf, avbHeader)
+
+}
+
 //goland:noinspection GoUnhandledErrorResult
-func findAndReadCentralDirectory(url string, partitionFilename string, filePath string, list bool, avb bool, sofOffset uint64, eofOffset uint64) error {
+func findAndReadCentralDirectory(image Image, partitionFilename string, filePath string, list bool, avb bool, sofOffset uint64, eofOffset uint64) error {
 	var eocdHeader EocdRecord
 	var eocd64locator Zip64EocdLocator
 	var eocd64record Zip64EocdRecord
@@ -584,10 +668,8 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 	sizeofEocd64locator := binary.Size(eocd64locator)
 	sizeofEocd64record := binary.Size(eocd64record)
 
-	client := &http.Client{}
-
 	eocdOffset := eofOffset - uint64(sizeofEocdHeader+sizeofEocd64locator+sizeofEocd64record)
-	eocdBuf, err := fetchRange(url, eocdOffset, eofOffset-1, "end of central directory", client)
+	eocdBuf, err := fetchRange(image, eocdOffset, eofOffset-1, "end of central directory")
 	if err != nil {
 		return err
 	}
@@ -596,10 +678,14 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 	err = readStruct(eocdBuf, eocdIdx, &eocdHeader, "end of central directory", [4]byte{'P', 'K', 0x05, 0x06}, binary.LittleEndian)
 	if err != nil {
 		eocdOffset -= 3998
-		eocdBuf, err = fetchRange(url, eocdOffset, eofOffset-1, "end of central directory", client)
+		eocdBuf, err = fetchRange(image, eocdOffset, eofOffset-1, "end of central directory")
+		// TODO: Why did I previously allow this error? Is it still needed?
+		if err != nil {
+			return err
+		}
 		eocdIdx = uint64(bytes.LastIndex(eocdBuf, []byte{'P', 'K', 0x05, 0x06}))
-		err2 := readStruct(eocdBuf, eocdIdx, &eocdHeader, "end of central directory", [4]byte{'P', 'K', 0x05, 0x06}, binary.LittleEndian)
-		if err2 != nil {
+		err = readStruct(eocdBuf, eocdIdx, &eocdHeader, "end of central directory", [4]byte{'P', 'K', 0x05, 0x06}, binary.LittleEndian)
+		if err != nil {
 			return err
 		}
 	}
@@ -619,7 +705,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 	}
 
 	innerCdOffset := sofOffset + cdOffset
-	cdBuf, err := fetchRange(url, innerCdOffset, innerCdOffset+cdSize-1, "central directory", client)
+	cdBuf, err := fetchRange(image, innerCdOffset, innerCdOffset+cdSize-1, "central directory")
 	if err != nil {
 		return err
 	}
@@ -709,7 +795,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 			fmt.Printf("%s%s | Offset: %d | Size: %d%s | Compression: %d\n", prefix, filename, lfhOffset, compressedSize, compressedSizeHuman, cdfHeader.CompressionMethod)
 		}
 		if nestedZipRegex.MatchString(filename) || (partitionFilename != "" && partitionRegex.MatchString(filename)) {
-			err = fetchStruct(url, sofOffset+lfhOffset, &lfHeader, "local file header", [4]byte{'P', 'K', 0x03, 0x04}, binary.LittleEndian, client)
+			err = fetchStruct(image, sofOffset+lfhOffset, &lfHeader, "local file header", [4]byte{'P', 'K', 0x03, 0x04}, binary.LittleEndian)
 			if err != nil {
 				return err
 			}
@@ -721,7 +807,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 
 			//goland:noinspection GoRedundantElseInIf
 			if nestedZipRegex.MatchString(filename) {
-				if err = findAndReadCentralDirectory(url, partitionFilename, filePath, list, avb, lfOffset, lfOffset+compressedSize); err != nil {
+				if err = findAndReadCentralDirectory(image, partitionFilename, filePath, list, avb, lfOffset, lfOffset+compressedSize); err != nil {
 					return err
 				} else if !list {
 					return nil
@@ -740,7 +826,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 					var sparseStub SparseStub
 					var sparseMagic [4]byte
 					binary.LittleEndian.PutUint32(sparseMagic[:], 0xed26ff3a)
-					err = fetchStruct(url, lfOffset, &sparseStub, "sparse stub", sparseMagic, binary.LittleEndian, client)
+					err = fetchStruct(image, lfOffset, &sparseStub, "sparse stub", sparseMagic, binary.LittleEndian)
 					if err == nil {
 						return fmt.Errorf("partition: sparse image format is not currently supported")
 					}
@@ -749,12 +835,12 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 					var erofsMagic [4]byte
 					binary.LittleEndian.PutUint32(erofsMagic[:], 0xe0f5e1e2)
 					erofsOffset := lfOffset + 0x400
-					err = fetchStruct(url, erofsOffset, &erofsStub, "erofs stub", erofsMagic, binary.LittleEndian, client)
+					err = fetchStruct(image, erofsOffset, &erofsStub, "erofs stub", erofsMagic, binary.LittleEndian)
 
 					//goland:noinspection GoRedundantElseInIf
 					if err == nil {
 						var superblock ErofsSuperblock
-						err = fetchStruct(url, erofsOffset, &superblock, "erofs superblock", erofsMagic, binary.LittleEndian, client)
+						err = fetchStruct(image, erofsOffset, &superblock, "erofs superblock", erofsMagic, binary.LittleEndian)
 						if err != nil {
 							return err
 						}
@@ -762,7 +848,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 						blockSize := uint64(1) << superblock.BlkSizeBits
 						nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + uint64(superblock.RootNid)*SizeofErofsInodeCompact
 
-						buf, err := fetchRange(url, lfOffset+nidOffset, lfOffset+nidOffset+1, "inode format check", client)
+						buf, err := fetchRange(image, lfOffset+nidOffset, lfOffset+nidOffset+1, "inode format check")
 						if err != nil {
 							return err
 						}
@@ -785,7 +871,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 							filePath = filepath.Dir(filePath)
 						}
 
-						return fetchFileErofs(url, lfOffset, uint64(superblock.RootNid), filePathParts, 0, superblock, client)
+						return fetchFileErofs(image, lfOffset, uint64(superblock.RootNid), filePathParts, 0, superblock)
 					} else {
 						return fmt.Errorf("ext4 format is not currently supported")
 					}
@@ -804,7 +890,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 								defer os.Remove(targetFilename)
 							}
 
-							hash, err := fetchFileZip(url, lfOffset, lfOffset+compressedSize-1, uncompressedSize, partitionFilename, targetFilename, cdfHeader.CompressionMethod, client)
+							hash, err := fetchFileZip(image, lfOffset, lfOffset+compressedSize-1, uncompressedSize, partitionFilename, targetFilename, cdfHeader.CompressionMethod)
 							if err != nil {
 								return err
 							}
@@ -812,94 +898,19 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 								os.Remove(partitionFilename)
 								return fmt.Errorf("central directory: hash mismatch")
 							} else if avb {
-								partition, err := os.Open(targetFilename)
+								file, err := os.Open(targetFilename)
 								if err != nil {
-									return fmt.Errorf("partition: failed to open for reading: %w", err)
+									return fmt.Errorf("failed to open temporary file: %w\n", err)
 								}
-								defer partition.Close()
-
-								avbHeaderBuf := make([]byte, AvbVBMetaImageHeaderSize)
-								if _, err := io.ReadFull(partition, avbHeaderBuf); err != nil {
-									return fmt.Errorf("partition: failed to read avb header: %w", err)
-								}
-
-								var avbHeader AvbVBMetaImageHeader
-								var avbHeaderMagic [4]byte
-								copy(avbHeaderMagic[:], AvbMagic)
-								err = readStruct(avbHeaderBuf, 0, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian)
-								if err != nil {
-									_, err = partition.Seek(-AvbFooterSize, io.SeekEnd)
-									if err != nil {
-										return fmt.Errorf("partition: failed to seek to avb footer: %w", err)
-									}
-
-									footerBuf := make([]byte, AvbFooterSize)
-									if _, err := io.ReadFull(partition, footerBuf); err != nil {
-										return fmt.Errorf("partition: failed to read avb footer: %w", err)
-									}
-
-									var avbFooterMagic [4]byte
-									copy(avbFooterMagic[:], AvbFooterMagic)
-
-									var avbFooter AvbFooter
-									err = readStruct(footerBuf, 0, &avbFooter, "avb footer", avbFooterMagic, binary.BigEndian)
-									if err != nil {
-										return err
-									}
-
-									partition.Seek(int64(avbFooter.VBMetaOffset), io.SeekStart)
-									if _, err := io.ReadFull(partition, avbHeaderBuf); err != nil {
-										return fmt.Errorf("partition: failed to read avb header: %w", err)
-									}
-
-									err = readStruct(avbHeaderBuf, 0, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian)
-									if err != nil {
-										return err
-									}
-
-									partition.Seek(int64(avbFooter.VBMetaOffset), io.SeekStart)
-								} else {
-									partition.Seek(0, io.SeekStart)
-								}
-
-								avbBuf := make([]byte, AvbVBMetaImageHeaderSize+avbHeader.AuthenticationDataBlockSize+avbHeader.AuxiliaryDataBlockSize)
-								if _, err := io.ReadFull(partition, avbBuf); err != nil {
-									return fmt.Errorf("partition: failed to read avb header: %w", err)
-								}
-								return printAvbPropertyDescriptors(avbBuf, avbHeader)
+								defer file.Close()
+								avbImage := &LocalImage{file: file}
+								return findAndPrintAvbPropertyDescriptors(avbImage, 0, uncompressedSize)
 							}
 
 							return nil
 						}()
 					} else {
-						var avbHeader AvbVBMetaImageHeader
-						var avbHeaderMagic [4]byte
-						copy(avbHeaderMagic[:], AvbMagic)
-						avbOffset := lfOffset
-						err = fetchStruct(url, avbOffset, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian, client)
-						if err != nil {
-							var avbFooter AvbFooter
-							var avbFooterMagic [4]byte
-							copy(avbFooterMagic[:], AvbFooterMagic)
-							footerOffset := lfOffset + compressedSize - 64
-							err = fetchStruct(url, footerOffset, &avbFooter, "avb footer", avbFooterMagic, binary.BigEndian, client)
-							if err != nil {
-								return err
-							}
-
-							avbOffset = lfOffset + avbFooter.VBMetaOffset
-
-							err = fetchStruct(url, avbOffset, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian, client)
-							if err != nil {
-								return err
-							}
-						}
-
-						avbBuf, err := fetchRange(url, avbOffset, avbOffset+AvbVBMetaImageHeaderSize+avbHeader.AuthenticationDataBlockSize+avbHeader.AuxiliaryDataBlockSize, "avb header", client)
-						if err != nil {
-							return err
-						}
-						return printAvbPropertyDescriptors(avbBuf, avbHeader)
+						return findAndPrintAvbPropertyDescriptors(image, lfOffset, uncompressedSize)
 					}
 				}
 			}
@@ -935,15 +946,15 @@ func main() {
 	flag.BoolVar(&avb, "avb", false, "")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <factoryImageURL> [partitionFilename [filePath]]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: pluck [flags] <factoryImageUrlOrFile> [partitionFilename [filePath]]\n\n")
 		fmt.Fprintln(os.Stderr, "Arguments:")
-		fmt.Fprintln(os.Stderr, "  factoryImageURL    URL of the factory image")
-		fmt.Fprintln(os.Stderr, "  partitionFilename  Name of the partition to download (optional)")
-		fmt.Fprintln(os.Stderr, "  filePath           Path to file in partition to download (optional)")
+		fmt.Fprintln(os.Stderr, "  factoryImageUrlOrFile Remote URL or local file path of the factory image")
+		fmt.Fprintln(os.Stderr, "  partitionFilename     Name of the partition to download (optional)")
+		fmt.Fprintln(os.Stderr, "  filePath              Path to file in partition to download (optional)")
 		fmt.Fprintln(os.Stderr, "\nFlags:")
-		fmt.Fprintln(os.Stderr, "  -v, --version      Print version and exit")
-		fmt.Fprintln(os.Stderr, "  -l, --list         List filenames")
-		fmt.Fprintln(os.Stderr, "  -a, --avb          List AVB props")
+		fmt.Fprintln(os.Stderr, "  -v, --version         Print version and exit")
+		fmt.Fprintln(os.Stderr, "  -l, --list            List filenames")
+		fmt.Fprintln(os.Stderr, "  -a, --avb             List AVB props")
 	}
 
 	flag.Parse()
@@ -984,7 +995,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	url := args[0]
+	urlOrFile := args[0]
 	partitionFilename := ""
 	filePath := ""
 	if len(args) > 1 {
@@ -994,21 +1005,54 @@ func main() {
 		filePath = args[2]
 	}
 
-	res, err := http.Head(url)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: factory image: HEAD request failed: %v\n", err)
-		os.Exit(1)
-	}
-	res.Body.Close()
+	var image Image
+	var imageSize int64
+	//goland:noinspection HttpUrlsUsage
+	if strings.HasPrefix(urlOrFile, "http://") || strings.HasPrefix(urlOrFile, "https://") {
+		client := &http.Client{}
+		res, err := client.Head(urlOrFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "factory image: HEAD request failed: %v\n", err)
+			os.Exit(1)
+		}
+		res.Body.Close()
 
-	contentLengthStr := res.Header.Get("Content-Length")
-	contentLength, err := strconv.ParseInt(contentLengthStr, 10, 64)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: factory image: failed to parse Content-Length: %v\n", err)
-		os.Exit(1)
+		if res.StatusCode != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "factory image: HEAD request rejected with status: %s\n", res.Status)
+			os.Exit(1)
+		}
+
+		image = &RemoteImage{
+			url:    urlOrFile,
+			client: client,
+		}
+		contentLengthStr := res.Header.Get("Content-Length")
+		imageSize, err = strconv.ParseInt(contentLengthStr, 10, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "factory image: failed to parse Content-Length: %v\n", err)
+			os.Exit(1)
+		}
+
+	} else {
+		file, err := os.Open(urlOrFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to open local file: %v\n", err)
+			os.Exit(1)
+		}
+		defer file.Close()
+
+		info, err := file.Stat()
+		if err != nil {
+			file.Close()
+			fmt.Fprintf(os.Stderr, "failed to stat local file: %v\n", err)
+			os.Exit(1)
+		}
+
+		image = &LocalImage{file: file}
+		imageSize = info.Size()
 	}
 
-	err = findAndReadCentralDirectory(url, partitionFilename, filePath, list, avb, 0, uint64(contentLength))
+	err := findAndReadCentralDirectory(image, partitionFilename, filePath, list, avb, 0, uint64(imageSize))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
