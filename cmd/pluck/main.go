@@ -237,6 +237,8 @@ func (a AvbVBMetaImageHeader) GetMagic() [4]byte { return a.Magic }
 const (
 	ChunkSize = 16384
 
+	SizeofErofsInodeCompact = 32
+
 	// https://erofs.docs.kernel.org/en/latest/ondisk/core_ondisk.html
 
 	ErofsFtRegFile = 1
@@ -405,7 +407,7 @@ func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, de
 				return fmt.Errorf("erofs: unexpected file but got unexpected type: %d", dirent.FileType)
 			}
 			blockSize := uint64(1) << superblock.BlkSizeBits
-			nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + dirent.Nid*32
+			nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + dirent.Nid*SizeofErofsInodeCompact
 
 			var inode ErofsInodeExtended
 			if err = fetchStruct(url, offset+nidOffset, &inode, "extended inode", emptyMagic, binary.LittleEndian, client); err != nil {
@@ -484,7 +486,7 @@ func fetchFileErofs(url string, offset uint64, nid uint64, filePath []string, de
 //goland:noinspection GoUnhandledErrorResult
 func fetchInodeDirents(nid uint64, url string, offset uint64, superblock ErofsSuperblock, client *http.Client) (map[string]ErofsDirent, error) {
 	blockSize := uint64(1) << superblock.BlkSizeBits
-	nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + nid*32
+	nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + nid*SizeofErofsInodeCompact
 
 	var inode ErofsInodeExtended
 	if err := fetchStruct(url, offset+nidOffset, &inode, "extended inode", emptyMagic, binary.LittleEndian, client); err != nil {
@@ -758,14 +760,13 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 						}
 
 						blockSize := uint64(1) << superblock.BlkSizeBits
-						nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + uint64(superblock.RootNid)*32
+						nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + uint64(superblock.RootNid)*SizeofErofsInodeCompact
 
-						var formatBits uint16
 						buf, err := fetchRange(url, lfOffset+nidOffset, lfOffset+nidOffset+1, "inode format check", client)
 						if err != nil {
 							return err
 						}
-						formatBits = binary.LittleEndian.Uint16(buf)
+						formatBits := binary.LittleEndian.Uint16(buf)
 						inodeFormat := (formatBits >> 1) & 0x07
 						dataMappingType := (formatBits >> 4) & 0x07
 
@@ -815,6 +816,7 @@ func findAndReadCentralDirectory(url string, partitionFilename string, filePath 
 								if err != nil {
 									return fmt.Errorf("partition: failed to open for reading: %w", err)
 								}
+								defer partition.Close()
 
 								avbHeaderBuf := make([]byte, AvbVBMetaImageHeaderSize)
 								if _, err := io.ReadFull(partition, avbHeaderBuf); err != nil {
@@ -957,7 +959,7 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-	if len(args) < 1 && len(args) > 3 {
+	if len(args) < 1 || len(args) > 3 {
 		flag.Usage()
 		os.Exit(1)
 	}
