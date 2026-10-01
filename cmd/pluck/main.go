@@ -124,7 +124,11 @@ type ErofsSuperblock struct {
 	Reserved         [23]byte
 }
 
-//goland:noinspection GoUnusedExportedType
+type ErofsInodeChunkInfo struct {
+	Format   uint16
+	Reserved uint16
+}
+
 type ErofsInodeCompact struct {
 	Format     uint16
 	XattrCount uint16
@@ -132,7 +136,7 @@ type ErofsInodeCompact struct {
 	Nlink      uint16
 	Size       uint32
 	Reserved   uint32
-	InodeData  uint32
+	ChunkInfo  ErofsInodeChunkInfo
 	Inode      uint32
 	UID        uint16
 	GID        uint16
@@ -145,13 +149,28 @@ type ErofsInodeExtended struct {
 	Mode       uint16
 	Reserved   uint16
 	Size       uint64
-	InodeData  uint32
+	ChunkInfo  ErofsInodeChunkInfo
 	Inode      uint32
 	Uid        uint32
 	Gid        uint32
 	Mtime      uint64
 	MtimeNs    uint32
 	Nlink      uint32
+}
+
+type ErofsXattrIbodyHeader struct {
+	NameFilter  uint32
+	SharedCount uint8
+	Reserved    [7]byte
+	// SharedXattrs [XattrCount]uint32
+}
+
+//goland:noinspection GoUnusedExportedType
+type ErofsXattrEntry struct {
+	NameLen   uint8
+	NameIndex uint8
+	ValueSize uint16
+	// Name      [NameLen]byte
 }
 
 type ErofsDirent struct {
@@ -162,9 +181,7 @@ type ErofsDirent struct {
 }
 
 type ErofsInodeChunkIndex struct {
-	StartBlkHi uint16
-	DeviceID   uint16
-	StartBlkLo uint32
+	StartBlk uint32
 }
 
 // https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_footer.h
@@ -279,7 +296,7 @@ func (r *RemoteImage) Close() error {
 	return nil
 }
 
-func (r *RemoteImage) OpenStream(offset, end uint64) (io.ReadCloser, error) {
+func (r *RemoteImage) OpenStream(offset uint64, end uint64) (io.ReadCloser, error) {
 	req, _ := http.NewRequest("GET", r.url, nil)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, end))
 
@@ -320,7 +337,11 @@ func (l *LocalImage) OpenStream(offset, end uint64) (io.ReadCloser, error) {
 const (
 	ChunkSize = 16384
 
-	SizeofErofsInodeCompact = 32
+	SizeofErofsInodeCompact     = 32
+	SizeofErofsInodeExtended    = 64
+	SizeofErofsXattrIbodyHeader = 12
+	SizeofSharedXattrs          = 4
+	SizeofErofsXattrEntry       = 4
 
 	// https://erofs.docs.kernel.org/en/latest/ondisk/core_ondisk.html
 
@@ -330,8 +351,16 @@ const (
 
 	// https://android.googlesource.com/kernel/common/+/refs/heads/android17-6.18-2026-09/fs/erofs/erofs_fs.h
 
-	ErofsINodeFlatPlain  = 0
-	ErofsIDatalayoutMask = uint16(0x07)
+	ErofsFeatureIncompatDeviceTable = uint64(0x00000008)
+	ErofsInodeFlatInline            = 2
+	ErofsInodeChunkBased            = 4
+	ErofsIVersionMask               = uint16(0x01)
+	ErofsIDatalayoutMask            = uint16(0x07)
+	ErofsIVersionBit                = 0
+	ErofsIDatalayoutBit             = 1
+	ErofsChunkFormatIndexes         = 0x0020
+	ErofsInodeLayoutCompact         = 0
+	ErofsInodeLayoutExtended        = 1
 
 	// https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_vbmeta_image.h
 	// https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_footer.h
@@ -349,21 +378,21 @@ var emptyMagic [4]byte
 var Version = "development"
 
 //goland:noinspection GoUnhandledErrorResult
-func fetchRange(src Image, offset uint64, end uint64, label string) ([]byte, error) {
+func fetchRange(image Image, offset uint64, end uint64) ([]byte, error) {
 	size := int(end - offset + 1)
 	buf := make([]byte, size)
-	n, err := src.ReadAt(buf, int64(offset))
+	n, err := image.ReadAt(buf, int64(offset))
 	if err != nil && (!errors.Is(err, io.EOF) || n != size) {
 		return nil, err
 	}
 	return buf, nil
 }
 
-func fetchStruct(src Image, offset uint64, target any, label string, magic [4]byte, order binary.ByteOrder) error {
+func fetchStruct(image Image, offset uint64, target any, label string, magic [4]byte, order binary.ByteOrder) error {
 	sizeofStruct := binary.Size(target)
 	end := offset + uint64(sizeofStruct) - 1
 
-	buf, err := fetchRange(src, offset, end, label)
+	buf, err := fetchRange(image, offset, end)
 	if err != nil {
 		return err
 	}
@@ -391,8 +420,8 @@ func readStruct(buf []byte, offset uint64, target any, label string, magic [4]by
 }
 
 //goland:noinspection GoUnhandledErrorResult
-func fetchFileZip(src Image, offset uint64, end uint64, uncompressedSize uint64, partitionFilename string, targetFilename string, compressionMethod uint16) (uint32, error) {
-	stream, err := src.OpenStream(offset, end)
+func fetchFileZip(image Image, offset uint64, end uint64, uncompressedSize uint64, partitionFilename string, targetFilename string, compressionMethod uint16) (uint32, error) {
+	stream, err := image.OpenStream(offset, end)
 	if err != nil {
 		return 0, err
 	}
@@ -466,30 +495,40 @@ func fetchFileErofs(image Image, offset uint64, nid uint64, filePath []string, d
 			return fetchFileErofs(image, offset, dirent.Nid, filePath, depth+1, superblock)
 		} else {
 			if dirent.FileType != ErofsFtRegFile {
-				return fmt.Errorf("erofs: unexpected file but got unexpected type: %d", dirent.FileType)
+				return fmt.Errorf("erofs: expected file but got unexpected type: %d", dirent.FileType)
 			}
 			blockSize := uint64(1) << superblock.BlkSizeBits
 			nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + dirent.Nid*SizeofErofsInodeCompact
 
-			var inode ErofsInodeExtended
-			if err = fetchStruct(image, offset+nidOffset, &inode, "extended inode", emptyMagic, binary.LittleEndian); err != nil {
-				return err
-			}
+			sizeofInode, sizeofXattr, fileSize, err := fetchInode(image, offset+nidOffset, ErofsInodeChunkBased)
 
-			dataLayout := (inode.Format & ErofsIDatalayoutMask) >> 1
-			if dataLayout != ErofsINodeFlatPlain {
-				return fmt.Errorf("erofs: unexpected file datalayout: %d", dirent.FileType)
-			}
-
-			sizeofInode := uint64(binary.Size(inode))
-			chunkIndexOffset := offset + nidOffset + sizeofInode
 			var chunkIndex ErofsInodeChunkIndex
-			if err = fetchStruct(image, chunkIndexOffset, &chunkIndex, "chunk index", emptyMagic, binary.LittleEndian); err != nil {
+			sizeofChunkIndex := uint64(binary.Size(chunkIndex))
+
+			chunkIndexOffset := offset + nidOffset + sizeofInode + sizeofXattr
+			totalBlocks := (fileSize + blockSize - 1) / blockSize
+			buf, err := fetchRange(image, chunkIndexOffset, chunkIndexOffset+totalBlocks*sizeofChunkIndex-1)
+			if err != nil {
 				return err
 			}
 
-			fileOffset := offset + uint64(chunkIndex.StartBlkHi)*blockSize
-			stream, err := image.OpenStream(fileOffset, fileOffset+inode.Size-1)
+			var startBlk uint32
+			for i := range totalBlocks {
+				chunkIndexOffset = sizeofChunkIndex * i
+				if err = readStruct(buf, chunkIndexOffset, &chunkIndex, "chunk index", emptyMagic, binary.LittleEndian); err != nil {
+					return err
+				}
+				if i == 0 {
+					startBlk = chunkIndex.StartBlk
+				} else {
+					if chunkIndex.StartBlk != startBlk+uint32(i) {
+						return fmt.Errorf("erofs: file blocks are non-contiguous, expected %d but got %d", startBlk+uint32(i), chunkIndex.StartBlk)
+					}
+				}
+			}
+
+			fileOffset := offset + uint64(startBlk)*blockSize
+			stream, err := image.OpenStream(fileOffset, fileOffset+fileSize-1)
 			if err != nil {
 				return err
 			}
@@ -516,7 +555,7 @@ func fetchFileErofs(image Image, offset uint64, nid uint64, filePath []string, d
 						return fmt.Errorf("file path: failed to write data to buffer: %v", writeErr)
 					}
 					totalWritten += int64(bytesWritten)
-					fmt.Printf("\r\033[2Kfile path: read %d of %d bytes", totalWritten, inode.Size)
+					fmt.Printf("\r\033[2Kfile path: read %d of %d bytes", totalWritten, fileSize)
 				}
 				if readErr == io.EOF {
 					break
@@ -536,19 +575,80 @@ func fetchFileErofs(image Image, offset uint64, nid uint64, filePath []string, d
 	}
 }
 
+func fetchInode(image Image, offset uint64, expectedDataLayout uint16) (uint64, uint64, uint64, error) {
+	inodeEnd := offset + SizeofErofsInodeExtended + SizeofErofsXattrIbodyHeader + SizeofSharedXattrs - 1
+	buf, err := fetchRange(image, offset, inodeEnd)
+	if err != nil {
+		// TODO: Allow io.EOF
+		return 0, 0, 0, err
+	}
+
+	var inodeCompact ErofsInodeCompact
+	if err = readStruct(buf, 0, &inodeCompact, "inode compact", emptyMagic, binary.LittleEndian); err != nil {
+		return 0, 0, 0, err
+	}
+
+	inodeVersion := (inodeCompact.Format >> ErofsIVersionBit) & ErofsIVersionMask
+	datalayout := (inodeCompact.Format >> ErofsIDatalayoutBit) & ErofsIDatalayoutMask
+
+	if datalayout != expectedDataLayout {
+		return 0, 0, 0, fmt.Errorf("erofs: inode format is not currently supported: %d", datalayout)
+	}
+	if expectedDataLayout == ErofsInodeChunkBased {
+		indexes := inodeCompact.ChunkInfo.Format & ErofsChunkFormatIndexes
+		if indexes != 0 {
+			return 0, 0, 0, fmt.Errorf("erofs: indexed chunk entries are not currently supported")
+		}
+	}
+	if inodeCompact.XattrCount > 3 {
+		return 0, 0, 0, fmt.Errorf("erofs: unexpected XattrCount: %d", inodeCompact.XattrCount)
+	}
+
+	var sizeofInode uint64
+	var targetSize uint64
+	if inodeVersion == ErofsInodeLayoutCompact {
+		sizeofInode = SizeofErofsInodeCompact
+		targetSize = uint64(inodeCompact.Size)
+	} else if inodeVersion == ErofsInodeLayoutExtended {
+		sizeofInode = SizeofErofsInodeExtended
+		var inodeExtended ErofsInodeExtended
+		if err = readStruct(buf, 0, &inodeExtended, "inode extended", emptyMagic, binary.LittleEndian); err != nil {
+			return 0, 0, 0, err
+		}
+		targetSize = inodeExtended.Size
+	}
+
+	var xattrIbody ErofsXattrIbodyHeader
+	if err = readStruct(buf, sizeofInode, &xattrIbody, "xattr ibody", emptyMagic, binary.LittleEndian); err != nil {
+		return 0, 0, 0, err
+	}
+
+	if xattrIbody.SharedCount > 1 {
+		return 0, 0, 0, fmt.Errorf("erofs: unexpected SharedCount: %d", xattrIbody.SharedCount)
+	}
+
+	sizeofXattr := uint64(binary.Size(xattrIbody)) + SizeofErofsXattrEntry
+
+	return sizeofInode, sizeofXattr, targetSize, nil
+}
+
 //goland:noinspection GoUnhandledErrorResult
 func fetchInodeDirents(nid uint64, image Image, offset uint64, superblock ErofsSuperblock) (map[string]ErofsDirent, error) {
 	blockSize := uint64(1) << superblock.BlkSizeBits
+
 	nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + nid*SizeofErofsInodeCompact
 
-	var inode ErofsInodeExtended
-	if err := fetchStruct(image, offset+nidOffset, &inode, "extended inode", emptyMagic, binary.LittleEndian); err != nil {
+	sizeofInode, sizeofXattr, direntSize, err := fetchInode(image, offset+nidOffset, ErofsInodeFlatInline)
+	if err != nil {
 		return nil, err
 	}
 
-	sizeofInode := uint64(binary.Size(inode))
-	direntOffset := offset + nidOffset + sizeofInode
-	buf, err := fetchRange(image, direntOffset, direntOffset+inode.Size-1, "dirents")
+	if direntSize > blockSize {
+		return nil, fmt.Errorf("erofs: multi-block dirents are not currently supported")
+	}
+
+	direntOffset := offset + nidOffset + sizeofInode + sizeofXattr
+	buf, err := fetchRange(image, direntOffset, direntOffset+direntSize-1)
 	if err != nil {
 		return nil, err
 	}
@@ -650,7 +750,7 @@ func findAndPrintAvbPropertyDescriptors(image Image, offset uint64, size uint64)
 		}
 	}
 
-	avbBuf, err := fetchRange(image, offset, offset+AvbVBMetaImageHeaderSize+avbHeader.AuthenticationDataBlockSize+avbHeader.AuxiliaryDataBlockSize-1, "avb header")
+	avbBuf, err := fetchRange(image, offset, offset+AvbVBMetaImageHeaderSize+avbHeader.AuthenticationDataBlockSize+avbHeader.AuxiliaryDataBlockSize-1)
 	if err != nil {
 		return err
 	}
@@ -669,7 +769,7 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 	sizeofEocd64record := binary.Size(eocd64record)
 
 	eocdOffset := eofOffset - uint64(sizeofEocdHeader+sizeofEocd64locator+sizeofEocd64record)
-	eocdBuf, err := fetchRange(image, eocdOffset, eofOffset-1, "end of central directory")
+	eocdBuf, err := fetchRange(image, eocdOffset, eofOffset-1)
 	if err != nil {
 		return err
 	}
@@ -677,14 +777,20 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 	eocdIdx := uint64(sizeofEocd64record + sizeofEocd64locator)
 	err = readStruct(eocdBuf, eocdIdx, &eocdHeader, "end of central directory", [4]byte{'P', 'K', 0x05, 0x06}, binary.LittleEndian)
 	if err != nil {
+		if eocdOffset < 3998 {
+			return fmt.Errorf("end of central directory: file smaller than fallback offset: %w", err)
+		}
 		eocdOffset -= 3998
-		eocdBuf, err = fetchRange(image, eocdOffset, eofOffset-1, "end of central directory")
+		eocdBuf, err = fetchRange(image, eocdOffset, eofOffset-1)
 		// TODO: Why did I previously allow this error? Is it still needed?
 		if err != nil {
 			return err
 		}
-		eocdIdx = uint64(bytes.LastIndex(eocdBuf, []byte{'P', 'K', 0x05, 0x06}))
-		err = readStruct(eocdBuf, eocdIdx, &eocdHeader, "end of central directory", [4]byte{'P', 'K', 0x05, 0x06}, binary.LittleEndian)
+		eocdIdx2 := bytes.LastIndex(eocdBuf, []byte{'P', 'K', 0x05, 0x06})
+		if eocdIdx2 == -1 {
+			return fmt.Errorf("end of central directory: unable to find magic")
+		}
+		err = readStruct(eocdBuf, uint64(eocdIdx2), &eocdHeader, "end of central directory", [4]byte{'P', 'K', 0x05, 0x06}, binary.LittleEndian)
 		if err != nil {
 			return err
 		}
@@ -705,7 +811,7 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 	}
 
 	innerCdOffset := sofOffset + cdOffset
-	cdBuf, err := fetchRange(image, innerCdOffset, innerCdOffset+cdSize-1, "central directory")
+	cdBuf, err := fetchRange(image, innerCdOffset, innerCdOffset+cdSize-1)
 	if err != nil {
 		return err
 	}
@@ -836,7 +942,6 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 					binary.LittleEndian.PutUint32(erofsMagic[:], 0xe0f5e1e2)
 					erofsOffset := lfOffset + 0x400
 					err = fetchStruct(image, erofsOffset, &erofsStub, "erofs stub", erofsMagic, binary.LittleEndian)
-
 					//goland:noinspection GoRedundantElseInIf
 					if err == nil {
 						var superblock ErofsSuperblock
@@ -845,20 +950,9 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 							return err
 						}
 
-						blockSize := uint64(1) << superblock.BlkSizeBits
-						nidOffset := uint64(superblock.MetaBlkAddr)*blockSize + uint64(superblock.RootNid)*SizeofErofsInodeCompact
-
-						buf, err := fetchRange(image, lfOffset+nidOffset, lfOffset+nidOffset+1, "inode format check")
-						if err != nil {
-							return err
-						}
-						formatBits := binary.LittleEndian.Uint16(buf)
-						inodeFormat := (formatBits >> 1) & 0x07
-						dataMappingType := (formatBits >> 4) & 0x07
-
-						// TODO: if the root inode is a specific format, does that imply the same for all of them?
-						if inodeFormat != 2 || dataMappingType != 0 {
-							return fmt.Errorf("erofs: node format is not currently supported: %d, %d", inodeFormat, dataMappingType)
+						deviceTable := uint64(superblock.FeatureIncompat) & ErofsFeatureIncompatDeviceTable
+						if deviceTable != 0 {
+							return fmt.Errorf("erofs: superblock feature is not currently supported: %d", deviceTable)
 						}
 
 						var filePathParts []string
@@ -883,11 +977,13 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 							if avb {
 								tmpFile, err := os.CreateTemp("", "pixel-plucker-*.img")
 								if err != nil {
+									tmpFile.Close()
+									os.Remove(tmpFile.Name())
 									return fmt.Errorf("central directory: failed to create temp file: %w", err)
 								}
+								defer os.Remove(tmpFile.Name())
 								targetFilename = tmpFile.Name()
 								tmpFile.Close()
-								defer os.Remove(targetFilename)
 							}
 
 							hash, err := fetchFileZip(image, lfOffset, lfOffset+compressedSize-1, uncompressedSize, partitionFilename, targetFilename, cdfHeader.CompressionMethod)
@@ -900,7 +996,7 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 							} else if avb {
 								file, err := os.Open(targetFilename)
 								if err != nil {
-									return fmt.Errorf("failed to open temporary file: %w\n", err)
+									return fmt.Errorf("failed to open temporary file: %w", err)
 								}
 								defer file.Close()
 								avbImage := &LocalImage{file: file}
