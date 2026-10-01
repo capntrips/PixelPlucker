@@ -85,7 +85,7 @@ func TestListRemote(t *testing.T) {
 
 func TestListLocal(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--list", "grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip"}
+		args := []string{"pluck", "--list", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip"}
 		callMain(args)
 	})
 
@@ -124,7 +124,7 @@ func TestExtractErofsRemoteCompressed(t *testing.T) {
 
 func TestExtractErofsLocalCompressed(t *testing.T) {
 	if os.Getenv("ALLOW_EXIT") == "1" {
-		args := []string{"pluck", "husky-cp3a.260905.009-factory-11774de0.zip", "system.img", "/system/build.prop"}
+		args := []string{"pluck", "../../husky-cp3a.260905.009-factory-11774de0.zip", "system.img", "/system/build.prop"}
 		callMain(args)
 		return
 	}
@@ -179,7 +179,7 @@ func TestExtractErofsRemoteUncompressed(t *testing.T) {
 
 func TestExtractErofsLocalUncompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system.img", "/system/build.prop"}
+		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system.img", "/system/build.prop"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
@@ -234,7 +234,7 @@ func TestExtractZipRemoteCompressed(t *testing.T) {
 
 func TestExtractZipLocalCompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
+		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
@@ -289,7 +289,7 @@ func TestExtractZipRemoteUncompressed(t *testing.T) {
 
 func TestExtractZipLocalUncompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system_dlkm.img"}
+		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system_dlkm.img"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
@@ -331,7 +331,7 @@ func TestAvbRemoteCompressed(t *testing.T) {
 
 func TestAvbLocalCompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--avb", "grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
+		args := []string{"pluck", "--avb", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
 		callMain(args)
 	})
 
@@ -358,7 +358,7 @@ func TestAvbRemoteUncompressed(t *testing.T) {
 
 func TestAvbLocalUncompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--avb", "grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "product.img"}
+		args := []string{"pluck", "--avb", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "product.img"}
 		callMain(args)
 	})
 
@@ -370,7 +370,7 @@ func TestAvbLocalUncompressed(t *testing.T) {
 
 func TestVbmetaLocal(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--avb", "grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "vbmeta_system.img"}
+		args := []string{"pluck", "--avb", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "vbmeta_system.img"}
 		callMain(args)
 	})
 
