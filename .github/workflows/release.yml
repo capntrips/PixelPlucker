@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build & Attest Release
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+
+      - name: Set up Task
+        uses: go-task/setup-task@v2
+        with:
+          version: 3.x
+
+      - name: Download Factory Images
+        run: |
+          curl -fLO --retry 3 --retry-connrefused "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip"
+          curl -fLO --retry 3 --retry-connrefused "https://dl.google.com/dl/android/aosp/husky-cp3a.260905.009-factory-11774de0.zip"
+
+      - name: Run Tests
+        run: go test -v -race ./cmd/pluck
+
+      - name: Delete Factory Images
+        run: |
+          rm -f grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip
+          rm -f husky-cp3a.260905.009-factory-11774de0.zip
+
+      - name: Build Binaries
+        run: |
+          export NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          task build VERSION=${{ github.ref_name }}
+
+      - name: Generate Artifact Attestations
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            pluck-linux-amd64
+            pluck-windows-amd64.exe
+            pluck-darwin-amd64
+            pluck-darwin-arm64
+            pluck-android-arm64
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pluck-linux-amd64
+            pluck-windows-amd64.exe
+            pluck-darwin-amd64
+            pluck-darwin-arm64
+            pluck-android-arm64
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
