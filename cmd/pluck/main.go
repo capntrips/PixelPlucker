@@ -431,7 +431,7 @@ func readStruct(buf []byte, offset uint64, target any, label string, magic [4]by
 	if magic != emptyMagic {
 		if provider, ok := target.(MagicProvider); ok {
 			if magic != provider.GetMagic() {
-				return fmt.Errorf("%s: unexpected magic value: %v", label, provider.GetMagic())
+				return fmt.Errorf("%s: unexpected magic value: %x", label, provider.GetMagic())
 			}
 		} else {
 			return fmt.Errorf("%s: failed to apply magic provider", label)
@@ -878,6 +878,16 @@ func findAndPrintAvbPropertyDescriptors(image Image, offset uint64, size uint64)
 
 }
 
+func findAndPrintAvbRollbackIndex(image Image, offset uint64, size uint64) error {
+	_, avbHeader, err := findAvbHeader(image, offset, size)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%d\n", avbHeader.RollbackIndex)
+	return nil
+
+}
+
 func findAndVerifyAvbHashDescriptor(image Image, offset uint64, size uint64, targetName string, targetPath string) error {
 	avbBuf, avbHeader, err := findAvbHeader(image, offset, size)
 	if err != nil {
@@ -888,7 +898,7 @@ func findAndVerifyAvbHashDescriptor(image Image, offset uint64, size uint64, tar
 }
 
 //goland:noinspection GoUnhandledErrorResult
-func findAndReadCentralDirectory(image Image, partitionFilename string, filePath string, list bool, avb bool, sofOffset uint64, eofOffset uint64) error {
+func findAndReadCentralDirectory(image Image, partitionFilename string, filePath string, list bool, avb bool, rollbackIndex bool, sofOffset uint64, eofOffset uint64) error {
 	var eocdHeader EocdRecord
 	var eocd64locator Zip64EocdLocator
 	var eocd64record Zip64EocdRecord
@@ -1042,7 +1052,7 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 
 			//goland:noinspection GoRedundantElseInIf
 			if nestedZipRegex.MatchString(filename) {
-				if err = findAndReadCentralDirectory(image, partitionFilename, filePath, list, avb, lfOffset, lfOffset+compressedSize); err != nil {
+				if err = findAndReadCentralDirectory(image, partitionFilename, filePath, list, avb, rollbackIndex, lfOffset, lfOffset+compressedSize); err != nil {
 					return err
 				} else if !list {
 					return nil
@@ -1085,13 +1095,21 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 								}
 								defer file.Close()
 								avbImage := &LocalImage{file: file}
-								return findAndPrintAvbPropertyDescriptors(avbImage, 0, uncompressedSize)
+								if !rollbackIndex {
+									return findAndPrintAvbPropertyDescriptors(avbImage, 0, uncompressedSize)
+								} else {
+									return findAndPrintAvbRollbackIndex(avbImage, 0, uncompressedSize)
+								}
 							}
 
 							return nil
 						}()
 					} else {
-						return findAndPrintAvbPropertyDescriptors(image, lfOffset, uncompressedSize)
+						if !rollbackIndex {
+							return findAndPrintAvbPropertyDescriptors(image, lfOffset, uncompressedSize)
+						} else {
+							return findAndPrintAvbRollbackIndex(image, 0, uncompressedSize)
+						}
 					}
 				}
 			}
@@ -1220,6 +1238,7 @@ func hasFlag(flag string) bool {
 
 //goland:noinspection GoUnhandledErrorResult
 func main() {
+	// TODO: Make flags global? Rework the app to have different commands?
 	var version bool
 	flag.BoolVar(&version, "v", false, "")
 	flag.BoolVar(&version, "version", false, "")
@@ -1234,6 +1253,9 @@ func main() {
 
 	var hashVerify bool
 	flag.BoolVar(&hashVerify, "hash-verify", false, "")
+
+	var rollbackIndex bool
+	flag.BoolVar(&rollbackIndex, "rollback-index", false, "")
 
 	var img bool
 	flag.BoolVar(&img, "i", false, "")
@@ -1250,16 +1272,17 @@ func main() {
 			fmt.Fprintln(os.Stderr, "  -v, --version           Print version and exit")
 			fmt.Fprintln(os.Stderr, "  -l, --list              List filenames")
 			fmt.Fprintln(os.Stderr, "  -a, --avb               List AVB props")
+			fmt.Fprintln(os.Stderr, "    --rollback-index      Print AVB rollback index")
 			fmt.Fprintln(os.Stderr, "  -i, --img               Work with partition images directly")
-		} else if !hasFlag("avb") || !hasFlag("hash-verify") {
+		} else if !hasFlag("hash-verify") {
 			fmt.Fprintf(os.Stderr, "Usage: pluck --img [-a|--avb] <partitionImageUrlOrFile> [filePath]\n\n")
 			fmt.Fprintln(os.Stderr, "Arguments:")
 			fmt.Fprintln(os.Stderr, "  partitionImageUrlOrFile URL or local file path of the partition image")
 			fmt.Fprintln(os.Stderr, "  filePath                Path to file in partition to download (optional)")
 			fmt.Fprintln(os.Stderr, "\nFlags:")
 			fmt.Fprintln(os.Stderr, "  -a, --avb               List AVB props")
+			fmt.Fprintln(os.Stderr, "    --rollback-index      Print rollback index")
 		} else {
-			// TODO: derive targetName from targetPath?
 			fmt.Fprintf(os.Stderr, "Usage: pluck --img --avb --hash-verify <vbmetaImageFile> <targetName> <targetPath>\n\n")
 			fmt.Fprintln(os.Stderr, "Arguments:")
 			fmt.Fprintln(os.Stderr, "  vbmetaImageFile         Local file path of the vbmeta image")
@@ -1278,7 +1301,22 @@ func main() {
 	}
 
 	if list && avb {
-		fmt.Fprintln(os.Stderr, "Error: list and avb are not compatible")
+		fmt.Fprintln(os.Stderr, "Error: list and avb are incompatible")
+		flag.Usage()
+		os.Exit(1)
+	}
+	if rollbackIndex && !avb {
+		fmt.Fprintln(os.Stderr, "Error: rollbackIndex requires avb")
+		flag.Usage()
+		os.Exit(1)
+	}
+	if hashVerify && !img {
+		fmt.Fprintln(os.Stderr, "Error: hashVerify requires img")
+		flag.Usage()
+		os.Exit(1)
+	}
+	if hashVerify && !avb {
+		fmt.Fprintln(os.Stderr, "Error: hashVerify requires avb")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -1298,7 +1336,7 @@ func main() {
 			os.Exit(1)
 		}
 		if avb && len(args) == 3 {
-			fmt.Fprintln(os.Stderr, "Error: filePath and avb are not compatible")
+			fmt.Fprintln(os.Stderr, "Error: filePath and avb are incompatible")
 			flag.Usage()
 			os.Exit(1)
 		}
@@ -1309,7 +1347,7 @@ func main() {
 		}
 	} else {
 		if list {
-			fmt.Fprintln(os.Stderr, "Error: list and img are not compatible")
+			fmt.Fprintln(os.Stderr, "Error: list and img are incompatible")
 			flag.Usage()
 			os.Exit(1)
 		}
@@ -1402,11 +1440,15 @@ func main() {
 
 	var err error
 	if !img {
-		err = findAndReadCentralDirectory(image, partitionFilename, filePath, list, avb, 0, uint64(imageSize))
+		err = findAndReadCentralDirectory(image, partitionFilename, filePath, list, avb, rollbackIndex, 0, uint64(imageSize))
 	} else if !avb {
 		err = findAndExtractFile(image, filePath, 0)
 	} else if !hashVerify {
-		err = findAndPrintAvbPropertyDescriptors(image, 0, uint64(imageSize))
+		if !rollbackIndex {
+			err = findAndPrintAvbPropertyDescriptors(image, 0, uint64(imageSize))
+		} else {
+			err = findAndPrintAvbRollbackIndex(image, 0, uint64(imageSize))
+		}
 	} else {
 		err = findAndVerifyAvbHashDescriptor(image, 0, uint64(imageSize), args[1], args[2])
 	}
