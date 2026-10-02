@@ -1208,8 +1208,23 @@ func main() {
 			os.Exit(1)
 		}
 
+		mode := info.Mode()
+		if mode.IsRegular() {
+			imageSize = info.Size()
+		} else if mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0 {
+			imageSize, err = file.Seek(0, io.SeekEnd)
+			if err != nil {
+				file.Close()
+				fmt.Fprintf(os.Stderr, "failed to seek local block device: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			file.Close()
+			fmt.Fprintf(os.Stderr, "unexpected local file type")
+			os.Exit(1)
+		}
+
 		image = &LocalImage{file: file}
-		imageSize = info.Size()
 	}
 
 	var err error
