@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/flate"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -224,7 +225,7 @@ type AvbVBMetaImageHeader struct {
 
 // https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_descriptor.h
 
-type AvbDescriptorHeader struct {
+type AvbDescriptor struct {
 	Tag               uint64
 	NumBytesFollowing uint64
 }
@@ -232,9 +233,22 @@ type AvbDescriptorHeader struct {
 // https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_property_descriptor.h
 
 type AvbPropertyDescriptor struct {
-	ParentDescriptor AvbDescriptorHeader
+	ParentDescriptor AvbDescriptor
 	KeyNumBytes      uint64
 	ValueNumBytes    uint64
+}
+
+// https://android.googlesource.com/platform/external/avb/+/refs/tags/android-17.0.0_r1/libavb/avb_hash_descriptor.h
+
+type AvbHashDescriptor struct {
+	ParentDescriptor AvbDescriptor
+	ImageSize        uint64
+	HashAlgorithm    [32]byte
+	PartitionNameLen uint32
+	SaltLen          uint32
+	DigestLen        uint32
+	Flags            uint32
+	Reserved         [60]byte
 }
 
 type MagicProvider interface {
@@ -371,11 +385,19 @@ const (
 	AvbFooterMagic           = "AVBf"
 	AvbFooterSize            = 64
 	AvbDescriptorTagProperty = 0
+	AvbDescriptorTagHash     = 2
 )
 
 var emptyMagic [4]byte
 
 var Version = "development"
+
+func cString(b []byte) string {
+	if before, _, ok := bytes.Cut(b, []byte{0}); ok {
+		return string(before)
+	}
+	return string(b)
+}
 
 //goland:noinspection GoUnhandledErrorResult
 func fetchRange(image Image, offset uint64, end uint64) ([]byte, error) {
@@ -447,7 +469,7 @@ func fetchFileZip(image Image, offset uint64, end uint64, uncompressedSize uint6
 	}
 
 	table := crc32.MakeTable(crc32.IEEE)
-	hash := crc32.New(table)
+	hasher := crc32.New(table)
 
 	chunk := make([]byte, ChunkSize)
 	var totalWritten int64 = 0
@@ -460,7 +482,7 @@ func fetchFileZip(image Image, offset uint64, end uint64, uncompressedSize uint6
 				fmt.Println()
 				return 0, fmt.Errorf("partition image: failed to write data to buffer: %v", writeErr)
 			}
-			hash.Write(chunk[:bytesRead])
+			hasher.Write(chunk[:bytesRead])
 			totalWritten += int64(bytesWritten)
 			fmt.Printf("\r\033[2Kpartition image: read %d of %d bytes", totalWritten, uncompressedSize)
 		}
@@ -475,7 +497,7 @@ func fetchFileZip(image Image, offset uint64, end uint64, uncompressedSize uint6
 
 	fmt.Println("\r\033[2Kpartition image: successfully written")
 
-	return hash.Sum32(), nil
+	return hasher.Sum32(), nil
 }
 
 func fetchFileErofs(image Image, offset uint64, nid uint64, filePath []string, depth int, superblock ErofsSuperblock) error {
@@ -695,7 +717,7 @@ func fetchInodeDirents(nid uint64, image Image, offset uint64, superblock ErofsS
 }
 
 func printAvbPropertyDescriptors(buf []byte, avbHeader AvbVBMetaImageHeader) error {
-	var avbDescriptor AvbDescriptorHeader
+	var avbDescriptor AvbDescriptor
 	var avbPropertyDescriptor AvbPropertyDescriptor
 	sizeofAvbDescriptor := binary.Size(avbDescriptor)
 	sizeofAvbPropertyDescriptor := uint64(binary.Size(avbPropertyDescriptor))
@@ -727,7 +749,97 @@ func printAvbPropertyDescriptors(buf []byte, avbHeader AvbVBMetaImageHeader) err
 	return nil
 }
 
-func findAndPrintAvbPropertyDescriptors(image Image, offset uint64, size uint64) error {
+func verifyPath(targetPath string, targetSize uint64, salt []byte, digest []byte) error {
+	hasher := sha256.New()
+	hasher.Write(salt)
+
+	file, _, err := openFile(targetPath)
+	if err != nil {
+		return fmt.Errorf("avb hash descriptor: failed to open target file: %w", err)
+	}
+	//goland:noinspection GoUnhandledErrorResult
+	defer file.Close()
+
+	target := io.NewSectionReader(file, 0, int64(targetSize))
+	chunk := make([]byte, ChunkSize)
+	for {
+		bytesRead, readErr := target.Read(chunk)
+		if bytesRead > 0 {
+			hasher.Write(chunk[:bytesRead])
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("target image: block read error: %v", readErr)
+		}
+	}
+	gotDigest := hasher.Sum(nil)
+
+	//goland:noinspection GoRedundantElseInIf
+	if !bytes.Equal(gotDigest, digest) {
+		return fmt.Errorf("target image: digest mismatch: %x != %x", gotDigest, digest)
+	} else {
+		fmt.Println("target verified")
+		return nil
+	}
+}
+
+func verifyAvbHashDescriptor(buf []byte, avbHeader AvbVBMetaImageHeader, targetName string, targetPath string) error {
+	var avbDescriptor AvbDescriptor
+	var avbHashDescriptor AvbHashDescriptor
+	sizeofAvbDescriptor := binary.Size(avbDescriptor)
+	sizeofAvbHashDescriptor := uint64(binary.Size(avbHashDescriptor))
+
+	var offset = AvbVBMetaImageHeaderSize + avbHeader.AuthenticationDataBlockSize + avbHeader.DescriptorsOffset
+	var descriptorsEnd = offset + avbHeader.DescriptorsSize
+	for offset < descriptorsEnd {
+		err := readStruct(buf, offset, &avbDescriptor, "avb descriptor", emptyMagic, binary.BigEndian)
+		if err != nil {
+			return fmt.Errorf("file path: failed to read avb descriptor: %w", err)
+		}
+
+		if avbDescriptor.Tag == AvbDescriptorTagHash {
+			err = readStruct(buf, offset, &avbHashDescriptor, "avb hash descriptor", emptyMagic, binary.BigEndian)
+			if err != nil {
+				return fmt.Errorf("file path: failed to read avb hash descriptor: %w", err)
+			}
+			nameOffset := offset + sizeofAvbHashDescriptor
+			saltOffset := nameOffset + uint64(avbHashDescriptor.PartitionNameLen)
+			digestOffset := saltOffset + uint64(avbHashDescriptor.SaltLen)
+			digestEnd := digestOffset + uint64(avbHashDescriptor.DigestLen)
+			name := string(buf[nameOffset:saltOffset])
+
+			if name != targetName {
+				continue
+			}
+
+			salt := buf[saltOffset:digestOffset]
+			digest := buf[digestOffset:digestEnd]
+
+			// fmt.Println("Hash descriptor:")
+			// fmt.Printf("  Image Size:            %d bytes\n", avbHashDescriptor.ImageSize)
+			// fmt.Printf("  Hash Algorithm:        %s\n", cString(avbHashDescriptor.HashAlgorithm[:]))
+			// fmt.Printf("  Partition Name:        %s\n", name)
+			// fmt.Printf("  Salt:                  %x\n", salt)
+			// fmt.Printf("  Digest:                %x\n", digest)
+			// fmt.Printf("  Flags:                 %d\n", avbHashDescriptor.Flags)
+
+			hashAlgorithm := cString(avbHashDescriptor.HashAlgorithm[:])
+			//goland:noinspection GoRedundantElseInIf
+			if hashAlgorithm == "sha256" {
+				return verifyPath(targetPath, avbHashDescriptor.ImageSize, salt, digest)
+			} else {
+				return fmt.Errorf("avb hash descriptor: unexpected hash algorithm: %s", hashAlgorithm)
+			}
+		}
+
+		offset += uint64(sizeofAvbDescriptor) + avbDescriptor.NumBytesFollowing
+	}
+	return fmt.Errorf("avb hash descriptor: failed to find target")
+}
+
+func findAvbHeader(image Image, offset uint64, size uint64) ([]byte, AvbVBMetaImageHeader, error) {
 	var avbHeader AvbVBMetaImageHeader
 	var avbHeaderMagic [4]byte
 	copy(avbHeaderMagic[:], AvbMagic)
@@ -739,22 +851,39 @@ func findAndPrintAvbPropertyDescriptors(image Image, offset uint64, size uint64)
 		footerOffset := offset + size - AvbFooterSize
 		err = fetchStruct(image, footerOffset, &avbFooter, "avb footer", avbFooterMagic, binary.BigEndian)
 		if err != nil {
-			return err
+			return nil, avbHeader, err
 		}
 
 		offset += avbFooter.VBMetaOffset
 
 		err = fetchStruct(image, offset, &avbHeader, "avb header", avbHeaderMagic, binary.BigEndian)
 		if err != nil {
-			return err
+			return nil, avbHeader, err
 		}
 	}
 
 	avbBuf, err := fetchRange(image, offset, offset+AvbVBMetaImageHeaderSize+avbHeader.AuthenticationDataBlockSize+avbHeader.AuxiliaryDataBlockSize-1)
 	if err != nil {
+		return nil, avbHeader, err
+	}
+	return avbBuf, avbHeader, nil
+}
+
+func findAndPrintAvbPropertyDescriptors(image Image, offset uint64, size uint64) error {
+	avbBuf, avbHeader, err := findAvbHeader(image, offset, size)
+	if err != nil {
 		return err
 	}
 	return printAvbPropertyDescriptors(avbBuf, avbHeader)
+
+}
+
+func findAndVerifyAvbHashDescriptor(image Image, offset uint64, size uint64, targetName string, targetPath string) error {
+	avbBuf, avbHeader, err := findAvbHeader(image, offset, size)
+	if err != nil {
+		return err
+	}
+	return verifyAvbHashDescriptor(avbBuf, avbHeader, targetName, targetPath)
 
 }
 
@@ -1039,9 +1168,50 @@ func findAndExtractFile(image Image, filePath string, offset uint64) error {
 	}
 }
 
+//goland:noinspection GoUnhandledErrorResult
+func openFile(filename string) (*os.File, int64, error) {
+	var imageSize int64
+
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to open local file: %v\n", err)
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, 0, fmt.Errorf("failed to stat local file: %v\n", err)
+	}
+
+	mode := info.Mode()
+	if mode.IsRegular() {
+		imageSize = info.Size()
+	} else if mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0 {
+		imageSize, err = file.Seek(0, io.SeekEnd)
+		if err != nil {
+			file.Close()
+			return nil, 0, fmt.Errorf("failed to seek local block device: %v\n", err)
+		}
+	} else {
+		file.Close()
+		return nil, 0, fmt.Errorf("unexpected local file type")
+	}
+
+	return file, imageSize, nil
+}
+
 func hasImgFlag() bool {
 	for _, arg := range os.Args {
 		if arg == "-i" || arg == "--img" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFlag(flag string) bool {
+	for _, arg := range os.Args {
+		if arg == fmt.Sprintf("--%s", flag) {
 			return true
 		}
 	}
@@ -1062,6 +1232,9 @@ func main() {
 	flag.BoolVar(&avb, "a", false, "")
 	flag.BoolVar(&avb, "avb", false, "")
 
+	var hashVerify bool
+	flag.BoolVar(&hashVerify, "hash-verify", false, "")
+
 	var img bool
 	flag.BoolVar(&img, "i", false, "")
 	flag.BoolVar(&img, "img", false, "")
@@ -1078,13 +1251,20 @@ func main() {
 			fmt.Fprintln(os.Stderr, "  -l, --list              List filenames")
 			fmt.Fprintln(os.Stderr, "  -a, --avb               List AVB props")
 			fmt.Fprintln(os.Stderr, "  -i, --img               Work with partition images directly")
-		} else {
+		} else if !hasFlag("avb") || !hasFlag("hash-verify") {
 			fmt.Fprintf(os.Stderr, "Usage: pluck --img [-a|--avb] <partitionImageUrlOrFile> [filePath]\n\n")
 			fmt.Fprintln(os.Stderr, "Arguments:")
 			fmt.Fprintln(os.Stderr, "  partitionImageUrlOrFile URL or local file path of the partition image")
 			fmt.Fprintln(os.Stderr, "  filePath                Path to file in partition to download (optional)")
 			fmt.Fprintln(os.Stderr, "\nFlags:")
 			fmt.Fprintln(os.Stderr, "  -a, --avb               List AVB props")
+		} else {
+			// TODO: derive targetName from targetPath?
+			fmt.Fprintf(os.Stderr, "Usage: pluck --img --avb --hash-verify <vbmetaImageFile> <targetName> <targetPath>\n\n")
+			fmt.Fprintln(os.Stderr, "Arguments:")
+			fmt.Fprintln(os.Stderr, "  vbmetaImageFile         Local file path of the vbmeta image")
+			fmt.Fprintln(os.Stderr, "  targetName              Name of the partition to verify")
+			fmt.Fprintln(os.Stderr, "  targetPath              Local file path of the partition to verify")
 		}
 
 	}
@@ -1133,19 +1313,33 @@ func main() {
 			flag.Usage()
 			os.Exit(1)
 		}
-		if len(args) < 1 || len(args) > 2 {
-			flag.Usage()
-			os.Exit(1)
-		}
-		if avb && len(args) > 1 {
-			fmt.Fprintln(os.Stderr, "Error: avb is only compatible with top level partition images when img flag is provided")
-			flag.Usage()
-			os.Exit(1)
-		}
-		if !avb && len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "Error: filePath is required when avb flag is not provided")
-			flag.Usage()
-			os.Exit(1)
+		if !avb {
+			if len(args) > 2 {
+				flag.Usage()
+				os.Exit(1)
+			}
+			if len(args) < 2 {
+				fmt.Fprintln(os.Stderr, "Error: filePath is required when avb flag is not provided")
+				flag.Usage()
+				os.Exit(1)
+			}
+		} else if !hashVerify {
+			if avb && len(args) > 1 {
+				fmt.Fprintln(os.Stderr, "Error: avb is only compatible with top level partition images when img flag is provided")
+				flag.Usage()
+				os.Exit(1)
+			}
+		} else {
+			if len(args) < 2 {
+				fmt.Fprintln(os.Stderr, "Error: targetName and targetPath are required when hash-verify flag is provided")
+				flag.Usage()
+				os.Exit(1)
+			}
+			if len(args) < 3 {
+				fmt.Fprintln(os.Stderr, "Error: targetPath is required when hash-verify flag is provided")
+				flag.Usage()
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -1194,37 +1388,16 @@ func main() {
 		}
 
 	} else {
-		file, err := os.Open(urlOrFile)
+		var file *os.File
+		var err error
+		file, imageSize, err = openFile(urlOrFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to open local file: %v\n", err)
+			fmt.Fprint(os.Stderr, err)
 			os.Exit(1)
 		}
 		defer file.Close()
-
-		info, err := file.Stat()
-		if err != nil {
-			file.Close()
-			fmt.Fprintf(os.Stderr, "failed to stat local file: %v\n", err)
-			os.Exit(1)
-		}
-
-		mode := info.Mode()
-		if mode.IsRegular() {
-			imageSize = info.Size()
-		} else if mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0 {
-			imageSize, err = file.Seek(0, io.SeekEnd)
-			if err != nil {
-				file.Close()
-				fmt.Fprintf(os.Stderr, "failed to seek local block device: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			file.Close()
-			fmt.Fprintf(os.Stderr, "unexpected local file type")
-			os.Exit(1)
-		}
-
 		image = &LocalImage{file: file}
+
 	}
 
 	var err error
@@ -1232,8 +1405,10 @@ func main() {
 		err = findAndReadCentralDirectory(image, partitionFilename, filePath, list, avb, 0, uint64(imageSize))
 	} else if !avb {
 		err = findAndExtractFile(image, filePath, 0)
-	} else {
+	} else if !hashVerify {
 		err = findAndPrintAvbPropertyDescriptors(image, 0, uint64(imageSize))
+	} else {
+		err = findAndVerifyAvbHashDescriptor(image, 0, uint64(imageSize), args[1], args[2])
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
