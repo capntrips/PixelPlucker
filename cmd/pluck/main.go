@@ -924,51 +924,7 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 					if cdfHeader.CompressionMethod == 8 {
 						return fmt.Errorf("partition: extracting files in compressed images is not currently supported")
 					}
-
-					if !path.IsAbs(filePath) {
-						return fmt.Errorf("partition: filePath must be an absolute path")
-					}
-
-					var sparseStub SparseStub
-					var sparseMagic [4]byte
-					binary.LittleEndian.PutUint32(sparseMagic[:], 0xed26ff3a)
-					err = fetchStruct(image, lfOffset, &sparseStub, "sparse stub", sparseMagic, binary.LittleEndian)
-					if err == nil {
-						return fmt.Errorf("partition: sparse image format is not currently supported")
-					}
-
-					var erofsStub ErofsStub
-					var erofsMagic [4]byte
-					binary.LittleEndian.PutUint32(erofsMagic[:], 0xe0f5e1e2)
-					erofsOffset := lfOffset + 0x400
-					err = fetchStruct(image, erofsOffset, &erofsStub, "erofs stub", erofsMagic, binary.LittleEndian)
-					//goland:noinspection GoRedundantElseInIf
-					if err == nil {
-						var superblock ErofsSuperblock
-						err = fetchStruct(image, erofsOffset, &superblock, "erofs superblock", erofsMagic, binary.LittleEndian)
-						if err != nil {
-							return err
-						}
-
-						deviceTable := uint64(superblock.FeatureIncompat) & ErofsFeatureIncompatDeviceTable
-						if deviceTable != 0 {
-							return fmt.Errorf("erofs: superblock feature is not currently supported: %d", deviceTable)
-						}
-
-						var filePathParts []string
-						for {
-							base := filepath.Base(filePath)
-							if base == string(filepath.Separator) {
-								break
-							}
-							filePathParts = append([]string{base}, filePathParts...)
-							filePath = filepath.Dir(filePath)
-						}
-
-						return fetchFileErofs(image, lfOffset, uint64(superblock.RootNid), filePathParts, 0, superblock)
-					} else {
-						return fmt.Errorf("ext4 format is not currently supported")
-					}
+					return findAndExtractFile(image, filePath, lfOffset)
 				} else {
 					if cdfHeader.CompressionMethod == 8 || !avb {
 						// allows defer in a loop
@@ -1027,6 +983,71 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, filePath
 	return nil
 }
 
+func findAndExtractFile(image Image, filePath string, offset uint64) error {
+	if !path.IsAbs(filePath) {
+		return fmt.Errorf("partition: filePath must be an absolute path")
+	}
+
+	var sparseStub SparseStub
+	var sparseMagic [4]byte
+	binary.LittleEndian.PutUint32(sparseMagic[:], 0xed26ff3a)
+	err := fetchStruct(image, offset, &sparseStub, "sparse stub", sparseMagic, binary.LittleEndian)
+	if err == nil {
+		return fmt.Errorf("partition: sparse image format is not currently supported")
+	}
+
+	var erofsStub ErofsStub
+	var erofsMagic [4]byte
+	binary.LittleEndian.PutUint32(erofsMagic[:], 0xe0f5e1e2)
+	erofsOffset := offset + 0x400
+	err = fetchStruct(image, erofsOffset, &erofsStub, "erofs stub", erofsMagic, binary.LittleEndian)
+	//goland:noinspection GoRedundantElseInIf
+	if err == nil {
+		var superblock ErofsSuperblock
+		err = fetchStruct(image, erofsOffset, &superblock, "erofs superblock", erofsMagic, binary.LittleEndian)
+		if err != nil {
+			return err
+		}
+
+		deviceTable := uint64(superblock.FeatureIncompat) & ErofsFeatureIncompatDeviceTable
+		if deviceTable != 0 {
+			return fmt.Errorf("erofs: superblock feature is not currently supported: %d", deviceTable)
+		}
+
+		var filePathParts []string
+		for {
+			base := filepath.Base(filePath)
+			if base == string(filepath.Separator) {
+				break
+			}
+			filePathParts = append([]string{base}, filePathParts...)
+			filePath = filepath.Dir(filePath)
+		}
+
+		return fetchFileErofs(image, offset, uint64(superblock.RootNid), filePathParts, 0, superblock)
+	} else {
+		ext4Offset := offset + 0x400 + 56
+		buf, err := fetchRange(image, ext4Offset, ext4Offset+2-1)
+		if err != nil {
+			return err
+		}
+		if binary.LittleEndian.Uint16(buf) == 0xef53 {
+			return fmt.Errorf("partition: ext4 format is not currently supported")
+		} else {
+			return fmt.Errorf("partition: format is unknown")
+		}
+	}
+}
+
+func hasImgFlag() bool {
+	for _, arg := range os.Args {
+		if arg == "-i" || arg == "--img" {
+			return true
+		}
+	}
+	return false
+}
+
 //goland:noinspection GoUnhandledErrorResult
 func main() {
 	var version bool
@@ -1041,16 +1062,31 @@ func main() {
 	flag.BoolVar(&avb, "a", false, "")
 	flag.BoolVar(&avb, "avb", false, "")
 
+	var img bool
+	flag.BoolVar(&img, "i", false, "")
+	flag.BoolVar(&img, "img", false, "")
+
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: pluck [flags] <factoryImageUrlOrFile> [partitionFilename [filePath]]\n\n")
-		fmt.Fprintln(os.Stderr, "Arguments:")
-		fmt.Fprintln(os.Stderr, "  factoryImageUrlOrFile Remote URL or local file path of the factory image")
-		fmt.Fprintln(os.Stderr, "  partitionFilename     Name of the partition to download (optional)")
-		fmt.Fprintln(os.Stderr, "  filePath              Path to file in partition to download (optional)")
-		fmt.Fprintln(os.Stderr, "\nFlags:")
-		fmt.Fprintln(os.Stderr, "  -v, --version         Print version and exit")
-		fmt.Fprintln(os.Stderr, "  -l, --list            List filenames")
-		fmt.Fprintln(os.Stderr, "  -a, --avb             List AVB props")
+		if !hasImgFlag() {
+			fmt.Fprintf(os.Stderr, "Usage: pluck [flags] <factoryImageUrlOrFile> [partitionFilename [filePath]]\n\n")
+			fmt.Fprintln(os.Stderr, "Arguments:")
+			fmt.Fprintln(os.Stderr, "  factoryImageUrlOrFile   Remote URL or local file path of the factory image")
+			fmt.Fprintln(os.Stderr, "  partitionFilename       Name of the partition to download (optional)")
+			fmt.Fprintln(os.Stderr, "  filePath                Path to file in partition to download (optional)")
+			fmt.Fprintln(os.Stderr, "\nFlags:")
+			fmt.Fprintln(os.Stderr, "  -v, --version           Print version and exit")
+			fmt.Fprintln(os.Stderr, "  -l, --list              List filenames")
+			fmt.Fprintln(os.Stderr, "  -a, --avb               List AVB props")
+			fmt.Fprintln(os.Stderr, "  -i, --img               Work with partition images directly")
+		} else {
+			fmt.Fprintf(os.Stderr, "Usage: pluck --img [-a|--avb] <partitionImageUrlOrFile> [filePath]\n\n")
+			fmt.Fprintln(os.Stderr, "Arguments:")
+			fmt.Fprintln(os.Stderr, "  partitionImageUrlOrFile URL or local file path of the partition image")
+			fmt.Fprintln(os.Stderr, "  filePath                Path to file in partition to download (optional)")
+			fmt.Fprintln(os.Stderr, "\nFlags:")
+			fmt.Fprintln(os.Stderr, "  -a, --avb               List AVB props")
+		}
+
 	}
 
 	flag.Parse()
@@ -1070,35 +1106,63 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-	if !list && len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "Error: partitionFilename is required when list flag is not provided")
-		flag.Usage()
-		os.Exit(1)
-	}
-	if avb && len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "Error: partitionFilename is required when avb flag is provided")
-		flag.Usage()
-		os.Exit(1)
-	}
-	if avb && len(args) == 3 {
-		fmt.Fprintln(os.Stderr, "Error: filePath and avb are not compatible")
-		flag.Usage()
-		os.Exit(1)
-	}
-	if list && len(args) > 1 {
-		fmt.Fprintln(os.Stderr, "Error: listing of files in partitionFilename is not supported")
-		flag.Usage()
-		os.Exit(1)
+	if !img {
+		if !list && len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "Error: partitionFilename is required when list flag is not provided")
+			flag.Usage()
+			os.Exit(1)
+		}
+		if avb && len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "Error: partitionFilename is required when avb flag is provided")
+			flag.Usage()
+			os.Exit(1)
+		}
+		if avb && len(args) == 3 {
+			fmt.Fprintln(os.Stderr, "Error: filePath and avb are not compatible")
+			flag.Usage()
+			os.Exit(1)
+		}
+		if list && len(args) > 1 {
+			fmt.Fprintln(os.Stderr, "Error: listing of files in partitionFilename is not supported")
+			flag.Usage()
+			os.Exit(1)
+		}
+	} else {
+		if list {
+			fmt.Fprintln(os.Stderr, "Error: list and img are not compatible")
+			flag.Usage()
+			os.Exit(1)
+		}
+		if len(args) < 1 || len(args) > 2 {
+			flag.Usage()
+			os.Exit(1)
+		}
+		if avb && len(args) > 1 {
+			fmt.Fprintln(os.Stderr, "Error: avb is only compatible with top level partition images when img flag is provided")
+			flag.Usage()
+			os.Exit(1)
+		}
+		if !avb && len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "Error: filePath is required when avb flag is not provided")
+			flag.Usage()
+			os.Exit(1)
+		}
 	}
 
 	urlOrFile := args[0]
 	partitionFilename := ""
 	filePath := ""
-	if len(args) > 1 {
-		partitionFilename = args[1]
-	}
-	if len(args) > 2 {
-		filePath = args[2]
+	if !img {
+		if len(args) > 1 {
+			partitionFilename = args[1]
+		}
+		if len(args) > 2 {
+			filePath = args[2]
+		}
+	} else {
+		if len(args) > 1 {
+			filePath = args[1]
+		}
 	}
 
 	var image Image
@@ -1148,7 +1212,14 @@ func main() {
 		imageSize = info.Size()
 	}
 
-	err := findAndReadCentralDirectory(image, partitionFilename, filePath, list, avb, 0, uint64(imageSize))
+	var err error
+	if !img {
+		err = findAndReadCentralDirectory(image, partitionFilename, filePath, list, avb, 0, uint64(imageSize))
+	} else if !avb {
+		err = findAndExtractFile(image, filePath, 0)
+	} else {
+		err = findAndPrintAvbPropertyDescriptors(image, 0, uint64(imageSize))
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

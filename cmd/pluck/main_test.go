@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -95,6 +96,7 @@ func TestListLocal(t *testing.T) {
 	}
 }
 
+//goland:noinspection DuplicatedCode
 func TestExtractErofsRemoteCompressed(t *testing.T) {
 	if os.Getenv("ALLOW_EXIT") == "1" {
 		args := []string{"pluck", "https://dl.google.com/dl/android/aosp/husky-cp3a.260905.009-factory-11774de0.zip", "system.img", "/system/build.prop"}
@@ -102,7 +104,7 @@ func TestExtractErofsRemoteCompressed(t *testing.T) {
 		return
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestExtractErofsRemoteCompressed")
+	cmd := exec.Command(os.Args[0], fmt.Sprintf("-test.run=%s", t.Name()))
 	cmd.Env = append(os.Environ(), "ALLOW_EXIT=1")
 
 	_, err := cmd.Output()
@@ -122,6 +124,7 @@ func TestExtractErofsRemoteCompressed(t *testing.T) {
 	}
 }
 
+//goland:noinspection DuplicatedCode
 func TestExtractErofsLocalCompressed(t *testing.T) {
 	if os.Getenv("ALLOW_EXIT") == "1" {
 		args := []string{"pluck", "../../husky-cp3a.260905.009-factory-11774de0.zip", "system.img", "/system/build.prop"}
@@ -129,7 +132,7 @@ func TestExtractErofsLocalCompressed(t *testing.T) {
 		return
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestExtractErofsRemoteCompressed")
+	cmd := exec.Command(os.Args[0], fmt.Sprintf("-test.run=%s", t.Name()))
 	cmd.Env = append(os.Environ(), "ALLOW_EXIT=1")
 
 	_, err := cmd.Output()
@@ -138,6 +141,37 @@ func TestExtractErofsLocalCompressed(t *testing.T) {
 	if e, ok := err.(*exec.ExitError); ok && !e.Success() {
 		got := string(e.Stderr)
 		expected := "Error: partition: extracting files in compressed images is not currently supported\n"
+		if got != expected {
+			t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+		}
+		if e.ExitCode() != 1 {
+			t.Errorf("Expected exit code 1, but got %d", e.ExitCode())
+		}
+	} else {
+		t.Error("Expected error but got success")
+	}
+}
+
+func TestExtractErofsLocalPartitionExt4(t *testing.T) {
+	if os.Getenv("ALLOW_EXIT") == "1" {
+		args := []string{"pluck", "../../husky-cp3a.260905.009-factory-11774de0.zip", "system.img"}
+		callMain(args)
+		args = []string{"pluck", "--img", "system.img", "/system/build.prop"}
+		callMain(args)
+		return
+	}
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("system.img")
+
+	cmd := exec.Command(os.Args[0], fmt.Sprintf("-test.run=%s", t.Name()))
+	cmd.Env = append(os.Environ(), "ALLOW_EXIT=1")
+
+	_, err := cmd.Output()
+
+	//goland:noinspection GoTypeAssertionOnErrors
+	if e, ok := err.(*exec.ExitError); ok && !e.Success() {
+		got := string(e.Stderr)
+		expected := "Error: partition: ext4 format is not currently supported\n"
 		if got != expected {
 			t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
 		}
@@ -177,6 +211,7 @@ func TestExtractErofsRemoteUncompressed(t *testing.T) {
 	}
 }
 
+//goland:noinspection DuplicatedCode
 func TestExtractErofsLocalUncompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
 		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system.img", "/system/build.prop"}
@@ -199,6 +234,58 @@ func TestExtractErofsLocalUncompressed(t *testing.T) {
 		t.Errorf("Error getting sha256 hash of build.prop: %s", err)
 	}
 	expected = "17065f6e88c44beb5d8ea25dd71ce22d84b1665828f2ced53a99d67d9857ea07"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+}
+
+//goland:noinspection DuplicatedCode
+func TestExtractErofsLocalPartition(t *testing.T) {
+	got, _ := captureOutput(func() {
+		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system.img"}
+		callMain(args)
+		args = []string{"pluck", "--img", "system.img", "/system/build.prop"}
+		callMain(args)
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("system.img")
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("build.prop")
+
+	split := strings.Split(got, "\r\033[2K")
+	got = split[len(split)-1]
+
+	expected := "file path: successfully written\n"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+
+	var err error
+	got, err = fileSha256("build.prop")
+	if err != nil {
+		t.Errorf("Error getting sha256 hash of build.prop: %s", err)
+	}
+	expected = "17065f6e88c44beb5d8ea25dd71ce22d84b1665828f2ced53a99d67d9857ea07"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+}
+
+//goland:noinspection DuplicatedCode
+func TestAvbLocalPartition(t *testing.T) {
+	got, _ := captureOutput(func() {
+		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "vbmeta_system.img"}
+		callMain(args)
+		args = []string{"pluck", "--img", "--avb", "vbmeta_system.img"}
+		callMain(args)
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("vbmeta_system.img")
+
+	split := strings.Split(got, "\r\033[2K")
+	got = split[len(split)-1]
+
+	expected := "partition image: successfully written\ncom.android.build.product.os_version=17\ncom.android.build.product.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.product.security_patch=2026-09-01\ncom.android.build.pvmfw.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system.os_version=17\ncom.android.build.system.fingerprint=google/generic_system_google/generic:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system.security_patch=2026-09-01\ncom.android.build.system_dlkm.os_version=17\ncom.android.build.system_dlkm.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system_ext.os_version=17\ncom.android.build.system_ext.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system_ext.security_patch=2026-09-01\n"
 	if got != expected {
 		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
 	}
@@ -232,6 +319,7 @@ func TestExtractZipRemoteCompressed(t *testing.T) {
 	}
 }
 
+//goland:noinspection DuplicatedCode
 func TestExtractZipLocalCompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
 		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
@@ -287,6 +375,7 @@ func TestExtractZipRemoteUncompressed(t *testing.T) {
 	}
 }
 
+//goland:noinspection DuplicatedCode
 func TestExtractZipLocalUncompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
 		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system_dlkm.img"}
