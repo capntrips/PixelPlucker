@@ -27,7 +27,6 @@ func callMain(args []string) {
 	main()
 }
 
-//goland:noinspection GoUnhandledErrorResult
 func captureOutput(f func()) (string, string) {
 	oldStdout := os.Stdout
 	oldStderr := os.Stderr
@@ -40,16 +39,22 @@ func captureOutput(f func()) (string, string) {
 	err := make(chan string)
 	go func() {
 		var bufout bytes.Buffer
-		var buferr bytes.Buffer
+		//goland:noinspection GoUnhandledErrorResult
 		io.Copy(&bufout, rout)
-		io.Copy(&buferr, rerr)
 		out <- bufout.String()
+	}()
+	go func() {
+		var buferr bytes.Buffer
+		//goland:noinspection GoUnhandledErrorResult
+		io.Copy(&buferr, rerr)
 		err <- buferr.String()
 	}()
 
 	f()
 
+	//goland:noinspection GoUnhandledErrorResult
 	wout.Close()
+	//goland:noinspection GoUnhandledErrorResult
 	werr.Close()
 	os.Stdout = oldStdout
 	os.Stderr = oldStderr
@@ -74,7 +79,7 @@ func fileSha256(filePath string) (string, error) {
 
 func TestListRemote(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--list", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip"}
+		args := []string{"pluck", "list-factory", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip"}
 		callMain(args)
 	})
 
@@ -86,7 +91,7 @@ func TestListRemote(t *testing.T) {
 
 func TestListLocal(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--list", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip"}
+		args := []string{"pluck", "list-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip"}
 		callMain(args)
 	})
 
@@ -97,12 +102,14 @@ func TestListLocal(t *testing.T) {
 }
 
 //goland:noinspection DuplicatedCode
-func TestExtractErofsRemoteCompressed(t *testing.T) {
+func TestExtractRemoteCompressedExt4(t *testing.T) {
 	if os.Getenv("ALLOW_EXIT") == "1" {
-		args := []string{"pluck", "https://dl.google.com/dl/android/aosp/husky-cp3a.260905.009-factory-11774de0.zip", "system.img", "/system/build.prop"}
+		args := []string{"pluck", "passthrough-factory", "https://dl.google.com/dl/android/aosp/husky-cp3a.260905.009-factory-11774de0.zip", "system_dlkm.img", "extract-erofs", "/etc/build.prop"}
 		callMain(args)
 		return
 	}
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("system_dlkm.img")
 
 	cmd := exec.Command(os.Args[0], fmt.Sprintf("-test.run=%s", t.Name()))
 	cmd.Env = append(os.Environ(), "ALLOW_EXIT=1")
@@ -112,7 +119,10 @@ func TestExtractErofsRemoteCompressed(t *testing.T) {
 	//goland:noinspection GoTypeAssertionOnErrors
 	if e, ok := err.(*exec.ExitError); ok && !e.Success() {
 		got := string(e.Stderr)
-		expected := "Error: partition: extracting files in compressed images is not currently supported\n"
+		split := strings.Split(got, "\r\033[2K")
+		got = split[len(split)-1]
+
+		expected := "tmp file: successfully written\ntmp file: file removed\nError: partition: ext4 format is not currently supported\n"
 		if got != expected {
 			t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
 		}
@@ -126,42 +136,46 @@ func TestExtractErofsRemoteCompressed(t *testing.T) {
 
 //goland:noinspection DuplicatedCode
 func TestExtractErofsLocalCompressed(t *testing.T) {
-	if os.Getenv("ALLOW_EXIT") == "1" {
-		args := []string{"pluck", "../../husky-cp3a.260905.009-factory-11774de0.zip", "system.img", "/system/build.prop"}
+	_, got := captureOutput(func() {
+		args := []string{"pluck", "passthrough-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system_dlkm.img", "extract-erofs", "/etc/build.prop"}
 		callMain(args)
-		return
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("system_dlkm.img")
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("build.prop")
+
+	split := strings.Split(got, "\r\033[2K")
+	got = split[len(split)-1]
+
+	expected := "file path: successfully written\n"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
 	}
 
-	cmd := exec.Command(os.Args[0], fmt.Sprintf("-test.run=%s", t.Name()))
-	cmd.Env = append(os.Environ(), "ALLOW_EXIT=1")
-
-	_, err := cmd.Output()
-
-	//goland:noinspection GoTypeAssertionOnErrors
-	if e, ok := err.(*exec.ExitError); ok && !e.Success() {
-		got := string(e.Stderr)
-		expected := "Error: partition: extracting files in compressed images is not currently supported\n"
-		if got != expected {
-			t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
-		}
-		if e.ExitCode() != 1 {
-			t.Errorf("Expected exit code 1, but got %d", e.ExitCode())
-		}
-	} else {
-		t.Error("Expected error but got success")
+	var err error
+	got, err = fileSha256("build.prop")
+	if err != nil {
+		t.Errorf("Error getting sha256 hash of build.prop: %s", err)
+	}
+	expected = "a1e698b57f7c1a4f08631e0ad7fd207a234368e860ad058491f4393667fb09dc"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
 	}
 }
 
 func TestExtractErofsLocalPartitionExt4(t *testing.T) {
 	if os.Getenv("ALLOW_EXIT") == "1" {
-		args := []string{"pluck", "../../husky-cp3a.260905.009-factory-11774de0.zip", "system.img"}
-		callMain(args)
-		args = []string{"pluck", "--img", "system.img", "/system/build.prop"}
+		captureOutput(func() {
+			args := []string{"pluck", "extract-factory", "../../husky-cp3a.260905.009-factory-11774de0.zip", "system_dlkm.img"}
+			callMain(args)
+		})
+		args := []string{"pluck", "extract-erofs", "system_dlkm.img", "/etc/build.prop"}
 		callMain(args)
 		return
 	}
 	//goland:noinspection GoUnhandledErrorResult
-	defer os.Remove("system.img")
+	defer os.Remove("system_dlkm.img")
 
 	cmd := exec.Command(os.Args[0], fmt.Sprintf("-test.run=%s", t.Name()))
 	cmd.Env = append(os.Environ(), "ALLOW_EXIT=1")
@@ -185,8 +199,8 @@ func TestExtractErofsLocalPartitionExt4(t *testing.T) {
 
 //goland:noinspection DuplicatedCode
 func TestExtractErofsRemoteUncompressed(t *testing.T) {
-	got, _ := captureOutput(func() {
-		args := []string{"pluck", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system.img", "/system/build.prop"}
+	_, got := captureOutput(func() {
+		args := []string{"pluck", "passthrough-factory", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system.img", "extract-erofs", "/system/build.prop"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
@@ -213,8 +227,8 @@ func TestExtractErofsRemoteUncompressed(t *testing.T) {
 
 //goland:noinspection DuplicatedCode
 func TestExtractErofsLocalUncompressed(t *testing.T) {
-	got, _ := captureOutput(func() {
-		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system.img", "/system/build.prop"}
+	_, got := captureOutput(func() {
+		args := []string{"pluck", "passthrough-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system.img", "extract-erofs", "/system/build.prop"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
@@ -241,14 +255,16 @@ func TestExtractErofsLocalUncompressed(t *testing.T) {
 
 //goland:noinspection DuplicatedCode
 func TestExtractErofsLocalPartition(t *testing.T) {
-	got, _ := captureOutput(func() {
-		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system.img"}
-		callMain(args)
-		args = []string{"pluck", "--img", "system.img", "/system/build.prop"}
+	_, got := captureOutput(func() {
+		captureOutput(func() {
+			args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system_dlkm.img"}
+			callMain(args)
+		})
+		args := []string{"pluck", "extract-erofs", "system_dlkm.img", "/etc/build.prop"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
-	defer os.Remove("system.img")
+	defer os.Remove("system_dlkm.img")
 	//goland:noinspection GoUnhandledErrorResult
 	defer os.Remove("build.prop")
 
@@ -265,36 +281,35 @@ func TestExtractErofsLocalPartition(t *testing.T) {
 	if err != nil {
 		t.Errorf("Error getting sha256 hash of build.prop: %s", err)
 	}
-	expected = "17065f6e88c44beb5d8ea25dd71ce22d84b1665828f2ced53a99d67d9857ea07"
+	expected = "a1e698b57f7c1a4f08631e0ad7fd207a234368e860ad058491f4393667fb09dc"
 	if got != expected {
 		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
 	}
 }
 
 //goland:noinspection DuplicatedCode
-func TestAvbLocalPartition(t *testing.T) {
+func TestListAvbPropsLocal(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "vbmeta_system.img"}
-		callMain(args)
-		args = []string{"pluck", "--img", "--avb", "vbmeta_system.img"}
+		captureOutput(func() {
+			args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "vbmeta_system.img"}
+			callMain(args)
+		})
+		args := []string{"pluck", "list-avb-props", "vbmeta_system.img"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
 	defer os.Remove("vbmeta_system.img")
 
-	split := strings.Split(got, "\r\033[2K")
-	got = split[len(split)-1]
-
-	expected := "partition image: successfully written\ncom.android.build.product.os_version=17\ncom.android.build.product.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.product.security_patch=2026-09-01\ncom.android.build.pvmfw.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system.os_version=17\ncom.android.build.system.fingerprint=google/generic_system_google/generic:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system.security_patch=2026-09-01\ncom.android.build.system_dlkm.os_version=17\ncom.android.build.system_dlkm.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system_ext.os_version=17\ncom.android.build.system_ext.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system_ext.security_patch=2026-09-01\n"
+	expected := "com.android.build.product.os_version=17\ncom.android.build.product.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.product.security_patch=2026-09-01\ncom.android.build.pvmfw.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system.os_version=17\ncom.android.build.system.fingerprint=google/generic_system_google/generic:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system.security_patch=2026-09-01\ncom.android.build.system_dlkm.os_version=17\ncom.android.build.system_dlkm.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system_ext.os_version=17\ncom.android.build.system_ext.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system_ext.security_patch=2026-09-01\n"
 	if got != expected {
 		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
 	}
 }
 
 //goland:noinspection DuplicatedCode
-func TestExtractZipRemoteCompressed(t *testing.T) {
-	got, _ := captureOutput(func() {
-		args := []string{"pluck", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
+func TestExtractFactoryRemoteCompressed(t *testing.T) {
+	_, got := captureOutput(func() {
+		args := []string{"pluck", "extract-factory", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
@@ -320,9 +335,9 @@ func TestExtractZipRemoteCompressed(t *testing.T) {
 }
 
 //goland:noinspection DuplicatedCode
-func TestExtractZipLocalCompressed(t *testing.T) {
-	got, _ := captureOutput(func() {
-		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
+func TestExtractFactoryLocalCompressed(t *testing.T) {
+	_, got := captureOutput(func() {
+		args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
@@ -348,9 +363,9 @@ func TestExtractZipLocalCompressed(t *testing.T) {
 }
 
 //goland:noinspection DuplicatedCode
-func TestExtractZipRemoteUncompressed(t *testing.T) {
-	got, _ := captureOutput(func() {
-		args := []string{"pluck", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system_dlkm.img"}
+func TestExtractFactoryRemoteUncompressed(t *testing.T) {
+	_, got := captureOutput(func() {
+		args := []string{"pluck", "extract-factory", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system_dlkm.img"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
@@ -376,9 +391,9 @@ func TestExtractZipRemoteUncompressed(t *testing.T) {
 }
 
 //goland:noinspection DuplicatedCode
-func TestExtractZipLocalUncompressed(t *testing.T) {
-	got, _ := captureOutput(func() {
-		args := []string{"pluck", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system_dlkm.img"}
+func TestExtractFactoryLocalUncompressed(t *testing.T) {
+	_, got := captureOutput(func() {
+		args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "system_dlkm.img"}
 		callMain(args)
 	})
 	//goland:noinspection GoUnhandledErrorResult
@@ -403,39 +418,33 @@ func TestExtractZipLocalUncompressed(t *testing.T) {
 	}
 }
 
-func TestAvbRemoteCompressed(t *testing.T) {
+func TestAvbPropsRemoteCompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--avb", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
+		args := []string{"pluck", "passthrough-factory", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img", "list-avb-props"}
 		callMain(args)
 	})
 
-	split := strings.Split(got, "\r\033[2K")
-	got = split[len(split)-1]
-
-	expected := "partition image: successfully written\ncom.android.build.init_boot.os_version=17\ncom.android.build.init_boot.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.init_boot.security_patch=2026-09-01\n"
+	expected := "com.android.build.init_boot.os_version=17\ncom.android.build.init_boot.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.init_boot.security_patch=2026-09-01\n"
 	if got != expected {
 		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
 	}
 }
 
-func TestAvbLocalCompressed(t *testing.T) {
+func TestAvbPropsLocalCompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--avb", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
+		args := []string{"pluck", "passthrough-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img", "list-avb-props"}
 		callMain(args)
 	})
 
-	split := strings.Split(got, "\r\033[2K")
-	got = split[len(split)-1]
-
-	expected := "partition image: successfully written\ncom.android.build.init_boot.os_version=17\ncom.android.build.init_boot.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.init_boot.security_patch=2026-09-01\n"
+	expected := "com.android.build.init_boot.os_version=17\ncom.android.build.init_boot.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.init_boot.security_patch=2026-09-01\n"
 	if got != expected {
 		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
 	}
 }
 
-func TestAvbRemoteUncompressed(t *testing.T) {
+func TestAvbPropsRemoteUncompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--avb", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "product.img"}
+		args := []string{"pluck", "passthrough-factory", "https://dl.google.com/dl/android/aosp/grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "product.img", "list-avb-props"}
 		callMain(args)
 	})
 
@@ -445,9 +454,9 @@ func TestAvbRemoteUncompressed(t *testing.T) {
 	}
 }
 
-func TestAvbLocalUncompressed(t *testing.T) {
+func TestAvbPropsLocalUncompressed(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--avb", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "product.img"}
+		args := []string{"pluck", "passthrough-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "product.img", "list-avb-props"}
 		callMain(args)
 	})
 
@@ -457,16 +466,202 @@ func TestAvbLocalUncompressed(t *testing.T) {
 	}
 }
 
-func TestVbmetaLocal(t *testing.T) {
+func TestAvbPropsLocalVbmeta(t *testing.T) {
 	got, _ := captureOutput(func() {
-		args := []string{"pluck", "--avb", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "vbmeta_system.img"}
+		args := []string{"pluck", "passthrough-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "vbmeta_system.img", "list-avb-props"}
 		callMain(args)
 	})
 
-	split := strings.Split(got, "\r\033[2K")
-	got = split[len(split)-1]
+	expected := "com.android.build.product.os_version=17\ncom.android.build.product.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.product.security_patch=2026-09-01\ncom.android.build.pvmfw.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system.os_version=17\ncom.android.build.system.fingerprint=google/generic_system_google/generic:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system.security_patch=2026-09-01\ncom.android.build.system_dlkm.os_version=17\ncom.android.build.system_dlkm.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system_ext.os_version=17\ncom.android.build.system_ext.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system_ext.security_patch=2026-09-01\n"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+}
 
-	expected := "partition image: successfully written\ncom.android.build.product.os_version=17\ncom.android.build.product.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.product.security_patch=2026-09-01\ncom.android.build.pvmfw.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system.os_version=17\ncom.android.build.system.fingerprint=google/generic_system_google/generic:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system.security_patch=2026-09-01\ncom.android.build.system_dlkm.os_version=17\ncom.android.build.system_dlkm.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system_ext.os_version=17\ncom.android.build.system_ext.fingerprint=google/grizzly/grizzly:17/CD1A.260905.001.B1/16238327:user/release-keys\ncom.android.build.system_ext.security_patch=2026-09-01\n"
+//goland:noinspection DuplicatedCode
+func TestAvbHashVerifyLocal(t *testing.T) {
+	captureOutput(func() {
+		args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "vbmeta.img"}
+		callMain(args)
+		args = []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "abl.img"}
+		callMain(args)
+	})
+	got, _ := captureOutput(func() {
+		args := []string{"pluck", "verify-avb-hash", "vbmeta.img", "abl", "abl.img"}
+		callMain(args)
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("vbmeta.img")
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("abl.img")
+
+	expected := "target verified\n"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+}
+
+//goland:noinspection DuplicatedCode
+func TestAvbHashVerifyLocalMissing(t *testing.T) {
+	if os.Getenv("ALLOW_EXIT") == "1" {
+		captureOutput(func() {
+			args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "vbmeta.img"}
+			callMain(args)
+			args = []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "init_boot.img"}
+			callMain(args)
+		})
+		args := []string{"pluck", "verify-avb-hash", "vbmeta.img", "init_boot", "init_boot.img"}
+		callMain(args)
+		return
+	}
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("vbmeta.img")
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("init_boot.img")
+
+	cmd := exec.Command(os.Args[0], fmt.Sprintf("-test.run=%s", t.Name()))
+	cmd.Env = append(os.Environ(), "ALLOW_EXIT=1")
+
+	_, err := cmd.Output()
+
+	//goland:noinspection GoTypeAssertionOnErrors
+	if e, ok := err.(*exec.ExitError); ok && !e.Success() {
+		got := string(e.Stderr)
+		expected := "Error: avb hash descriptor: failed to find target\n"
+		if got != expected {
+			t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+		}
+		if e.ExitCode() != 1 {
+			t.Errorf("Expected exit code 1, but got %d", e.ExitCode())
+		}
+	} else {
+		t.Error("Expected error but got success")
+	}
+}
+
+//goland:noinspection DuplicatedCode
+func TestListAvbRollbackIndexLocal(t *testing.T) {
+	captureOutput(func() {
+		args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "vbmeta.img"}
+		callMain(args)
+	})
+	got, _ := captureOutput(func() {
+		args := []string{"pluck", "list-avb-rollback-index", "vbmeta.img"}
+		callMain(args)
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("vbmeta.img")
+
+	expected := "1788220800\n"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+}
+
+func TestListBootloaderLocal(t *testing.T) {
+	captureOutput(func() {
+		args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "bootloader.img"}
+		callMain(args)
+	})
+	got, _ := captureOutput(func() {
+		args := []string{"pluck", "list-bootloader", "bootloader.img"}
+		callMain(args)
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("bootloader.img")
+
+	expected := "Header:\nmagic:              0x4642504b\nversion:            2\nheader size:        112\nentry header size:  104\nplatform:           mbu\npack version:       spacecraft-17.4-16238327\nslot type:          0\ndata align:         512\ntotal entries:      34\ntotal size:         22754404\n\nEntries:\noffset: 112\nEntry 1 {\n    name:       ufs\n    type:       partition data\n    product:    \n    offset:     0x1000 (4096)\n    size:       0xc5 (197)\n    slotted:    false\n    crc32:      0x00000000\n}\noffset: 216\nEntry 2 {\n    name:       ufs\n    type:       partition data\n    product:    \n    offset:     0x1200 (4608)\n    size:       0xc5 (197)\n    slotted:    false\n    crc32:      0x00000000\n}\noffset: 320\nEntry 3 {\n    name:       partition:0\n    type:       partition data\n    product:    default\n    offset:     0x1400 (5120)\n    size:       0x1690 (5776)\n    slotted:    false\n    crc32:      0x00000000\n}\noffset: 424\nEntry 4 {\n    name:       partition:1\n    type:       partition data\n    product:    default\n    offset:     0x2c00 (11264)\n    size:       0xf20 (3872)\n    slotted:    false\n    crc32:      0x00000000\n}\noffset: 528\nEntry 5 {\n    name:       partition:1\n    type:       partition data\n    product:    bms_redwood_partitions\n    offset:     0x3c00 (15360)\n    size:       0xfa8 (4008)\n    slotted:    false\n    crc32:      0x00000000\n}\noffset: 632\nEntry 6 {\n    name:       partition:2\n    type:       partition data\n    product:    default\n    offset:     0x4c00 (19456)\n    size:       0xf20 (3872)\n    slotted:    false\n    crc32:      0x00000000\n}\noffset: 736\nEntry 7 {\n    name:       partition:2\n    type:       partition data\n    product:    bms_redwood_partitions\n    offset:     0x5c00 (23552)\n    size:       0xfa8 (4008)\n    slotted:    false\n    crc32:      0x00000000\n}\noffset: 840\nEntry 8 {\n    name:       partition:3\n    type:       partition data\n    product:    \n    offset:     0x6c00 (27648)\n    size:       0x2e8 (744)\n    slotted:    false\n    crc32:      0x00000000\n}\noffset: 944\nEntry 9 {\n    name:       dbl\n    type:       partition data\n    product:    \n    offset:     0x7000 (28672)\n    size:       0x52000 (335872)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 1048\nEntry 10 {\n    name:       dram_init_0\n    type:       partition data\n    product:    \n    offset:     0x59000 (364544)\n    size:       0x2b000 (176128)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 1152\nEntry 11 {\n    name:       dram_init_1\n    type:       partition data\n    product:    \n    offset:     0x84000 (540672)\n    size:       0x2b000 (176128)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 1256\nEntry 12 {\n    name:       dram_init_2\n    type:       partition data\n    product:    \n    offset:     0xaf000 (716800)\n    size:       0x2b000 (176128)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 1360\nEntry 13 {\n    name:       dram_init_3\n    type:       partition data\n    product:    \n    offset:     0xda000 (892928)\n    size:       0x2b000 (176128)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 1464\nEntry 14 {\n    name:       dram_init_4\n    type:       partition data\n    product:    \n    offset:     0x105000 (1069056)\n    size:       0x2b000 (176128)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 1568\nEntry 15 {\n    name:       dram_init_5\n    type:       partition data\n    product:    \n    offset:     0x130000 (1245184)\n    size:       0x2b000 (176128)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 1672\nEntry 16 {\n    name:       dram_init_6\n    type:       partition data\n    product:    \n    offset:     0x15b000 (1421312)\n    size:       0x2d000 (184320)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 1776\nEntry 17 {\n    name:       dram_init_7\n    type:       partition data\n    product:    \n    offset:     0x188000 (1605632)\n    size:       0x2d000 (184320)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 1880\nEntry 18 {\n    name:       dram_init_8\n    type:       partition data\n    product:    \n    offset:     0x1b5000 (1789952)\n    size:       0x2d000 (184320)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 1984\nEntry 19 {\n    name:       dram_init_9\n    type:       partition data\n    product:    \n    offset:     0x1e2000 (1974272)\n    size:       0x2d000 (184320)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 2088\nEntry 20 {\n    name:       dram_init_10\n    type:       partition data\n    product:    \n    offset:     0x20f000 (2158592)\n    size:       0x2d000 (184320)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 2192\nEntry 21 {\n    name:       dram_init_11\n    type:       partition data\n    product:    \n    offset:     0x23c000 (2342912)\n    size:       0x2d000 (184320)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 2296\nEntry 22 {\n    name:       dram_phy\n    type:       partition data\n    product:    \n    offset:     0x269000 (2527232)\n    size:       0x29000 (167936)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 2400\nEntry 23 {\n    name:       gc\n    type:       partition data\n    product:    \n    offset:     0x292000 (2695168)\n    size:       0x22000 (139264)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 2504\nEntry 24 {\n    name:       dbc\n    type:       partition data\n    product:    \n    offset:     0x2b4000 (2834432)\n    size:       0x40000 (262144)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 2608\nEntry 25 {\n    name:       gsa_bl1\n    type:       partition data\n    product:    \n    offset:     0x2f4000 (3096576)\n    size:       0xc000 (49152)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 2712\nEntry 26 {\n    name:       gsa_fw\n    type:       partition data\n    product:    \n    offset:     0x300000 (3145728)\n    size:       0x22e000 (2285568)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 2816\nEntry 27 {\n    name:       bl31\n    type:       partition data\n    product:    \n    offset:     0x52e000 (5431296)\n    size:       0x30000 (196608)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 2920\nEntry 28 {\n    name:       tzsw\n    type:       partition data\n    product:    \n    offset:     0x55e000 (5627904)\n    size:       0x77d000 (7852032)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 3024\nEntry 29 {\n    name:       abl\n    type:       partition data\n    product:    \n    offset:     0xcdb000 (13479936)\n    size:       0x347000 (3436544)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 3128\nEntry 30 {\n    name:       cpm\n    type:       partition data\n    product:    \n    offset:     0x1022000 (16916480)\n    size:       0x9b000 (634880)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 3232\nEntry 31 {\n    name:       gdmc\n    type:       partition data\n    product:    \n    offset:     0x10bd000 (17551360)\n    size:       0x52000 (335872)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 3336\nEntry 32 {\n    name:       cap\n    type:       partition data\n    product:    \n    offset:     0x110f000 (17887232)\n    size:       0xc000 (49152)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 3440\nEntry 33 {\n    name:       bms\n    type:       partition data\n    product:    bms_redwood_partitions\n    offset:     0x111b000 (17936384)\n    size:       0x5000 (20480)\n    slotted:    true\n    crc32:      0x00000000\n}\noffset: 3544\nEntry 34 {\n    name:       ufsfwupdate\n    type:       sideload\n    product:    \n    offset:     0x1120000 (17956864)\n    size:       0x493464 (4797540)\n    slotted:    false\n    crc32:      0x00000000\n}\n"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+}
+
+func TestExtractBootloaderLocal(t *testing.T) {
+	captureOutput(func() {
+		args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "bootloader.img"}
+		callMain(args)
+	})
+	got, _ := captureOutput(func() {
+		args := []string{"pluck", "extract-bootloader", "bootloader.img", "abl"}
+		callMain(args)
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("bootloader.img")
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("abl.img")
+
+	expected := ""
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+
+	var err error
+	got, err = fileSha256("abl.img")
+	if err != nil {
+		t.Errorf("Error getting sha256 hash of abl.img: %s", err)
+	}
+
+	expected = "3343fc8493c5c1ebcbaa43f32745f5a9265f758a2ab505eff35aaa293ec687f3"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+}
+
+func TestPassthroughExtractBootloader(t *testing.T) {
+	got, _ := captureOutput(func() {
+		args := []string{"pluck", "passthrough-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "bootloader.img", "extract-bootloader", "abl"}
+		callMain(args)
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("abl.img")
+
+	expected := ""
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+
+	var err error
+	got, err = fileSha256("abl.img")
+	if err != nil {
+		t.Errorf("Error getting sha256 hash of abl.img: %s", err)
+	}
+	expected = "3343fc8493c5c1ebcbaa43f32745f5a9265f758a2ab505eff35aaa293ec687f3"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+}
+
+func TestPassthroughListBootloaderImageAr(t *testing.T) {
+	captureOutput(func() {
+		args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "abl.img"}
+		callMain(args)
+	})
+	got, _ := captureOutput(func() {
+		args := []string{"pluck", "passthrough-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "abl.img", "list-bootloader-image-ar"}
+		callMain(args)
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("abl.img")
+
+	expected := "nonsec_ar=2\n"
+	if got != expected {
+		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
+	}
+}
+
+func TestListBootloaderArLocal(t *testing.T) {
+	captureOutput(func() {
+		args := []string{"pluck", "extract-factory", "../../grizzly-cd1a.260905.001.b1-factory-4ce23ec8.zip", "bootloader.img"}
+		callMain(args)
+	})
+	got, _ := captureOutput(func() {
+		args := []string{"pluck", "list-bootloader-ar", "bootloader.img", "gsa_bl1"}
+		callMain(args)
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer os.Remove("bootloader.img")
+
+	expected := "sec_ar=2\n"
 	if got != expected {
 		t.Errorf("got:\n%s\nexpected:\n%s", got, expected)
 	}
