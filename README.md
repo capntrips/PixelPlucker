@@ -34,6 +34,8 @@ Extract partition from factory image
 Arguments:
   factoryImageUrlOrFile     Remote URL or local file path of factory image
   partitionFilename         Name of partition image to extract
+
+Use radio.img to extract radio-*.img with its original filename.
 ```
 
 ```text
@@ -45,6 +47,8 @@ Arguments:
   factoryImageUrlOrFile     Remote URL or local file path of factory image
   partitionFilename         Name of partition image to pass through
   subcommand                Subcommand to handle partition image
+
+Use radio.img to select radio-*.img from the factory archive.
 
 Supported subcommands:
   extract-erofs             Extract target file from erofs partition image
@@ -152,6 +156,22 @@ Arguments:
   targetName                Name of partition to verify
   targetPath                Local file/device path of partition to verify
 ```
+
+`radio.img` selects the versioned `radio-*.img` file in the outer factory ZIP.
+Extraction preserves its original filename (without the archive directory), so
+you do not need to know the device or radio version ahead of time:
+
+```sh
+pluck extract-factory <factoryImageUrlOrFile> radio.img
+```
+
+This selects the outer radio image, rather than `modem.img` inside the nested
+`image-*.zip`, and prints the saved filename after successful extraction.
+The alias is also available in `passthrough-factory`; the selected image must
+be compatible with the chosen subcommand. `extract-zip` continues to use the
+archive filename directly and does not resolve the `radio.img` alias.
+The existing `bootloader.img` alias continues to save as
+`bootloader.img`.
 
 ### Examples
 ```bash

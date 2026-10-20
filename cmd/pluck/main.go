@@ -1224,9 +1224,12 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, command 
 	var lfHeader LocalFileHeader
 
 	var nestedZipRegex = regexp.MustCompile(`.+/image-.+\.zip`)
+	useRadioAlias := partitionFilename == "radio.img" && (command == "extract-factory" || command == "passthrough-factory")
 	var partitionRegex *regexp.Regexp
 	if partitionFilename == "bootloader.img" {
 		partitionRegex = regexp.MustCompile(`.+/bootloader-.+\.img`)
+	} else if useRadioAlias {
+		partitionRegex = regexp.MustCompile(`(^|/)radio-[^/]+\.img$`)
 	} else {
 		partitionRegex = regexp.MustCompile(fmt.Sprintf(`(^|/)%s`, regexp.QuoteMeta(partitionFilename)))
 	}
@@ -1313,7 +1316,7 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, command 
 			}
 			fmt.Printf("%s%s | Offset: %d | Size: %d%s | Compression: %d\n", prefix, filename, lfhOffset, compressedSize, compressedSizeHuman, cdfHeader.CompressionMethod)
 		}
-		if nestedZipRegex.MatchString(filename) || (partitionFilename != "" && partitionRegex.MatchString(filename)) {
+		if (nestedZipRegex.MatchString(filename) && !useRadioAlias) || (partitionFilename != "" && partitionRegex.MatchString(filename)) {
 			err = fetchStruct(image, sofOffset+lfhOffset, &lfHeader, "local file header", [4]byte{'P', 'K', 0x03, 0x04}, binary.LittleEndian)
 			if err != nil {
 				return err
@@ -1362,6 +1365,9 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, command 
 						} else {
 							label = "partition image"
 							targetFilename = partitionFilename
+							if useRadioAlias {
+								targetFilename = path.Base(filename)
+							}
 						}
 
 						hashCrc32, err := fetchFileZip(image, lfOffset, lfOffset+compressedSize-1, uncompressedSize, label, targetFilename, cdfHeader.CompressionMethod)
@@ -1370,7 +1376,7 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, command 
 						}
 						if hashCrc32 != cdfHeader.Crc32 {
 							//goland:noinspection GoUnhandledErrorResult
-							os.Remove(partitionFilename)
+							os.Remove(targetFilename)
 							return fmt.Errorf("central directory: hash mismatch")
 						} else {
 							file, err := os.Open(targetFilename)
@@ -1389,7 +1395,9 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, command 
 
 					switch command {
 					case "extract-factory", "extract-zip":
-						// do nothing, file already extracted
+						if useRadioAlias {
+							fmt.Fprintf(os.Stderr, "partition image: saved to %s\n", path.Base(filename))
+						}
 					case "passthrough-factory":
 						switch subcommand {
 						case "extract-erofs":
@@ -1438,7 +1446,10 @@ func findAndReadCentralDirectory(image Image, partitionFilename string, command 
 	if command != "list-factory" {
 		//goland:noinspection GoRedundantElseInIf
 		if sofOffset == 0 {
-			return fmt.Errorf("failed to find nested image zip")
+			if command == "extract-factory" || command == "passthrough-factory" {
+				return fmt.Errorf("partition image %q not found in factory archive", partitionFilename)
+			}
+			return fmt.Errorf("file %q not found in zip archive", partitionFilename)
 		}
 	}
 
@@ -1564,6 +1575,7 @@ func showCommandUsage(command string) {
 		fmt.Fprintln(os.Stderr, "\nArguments:")
 		fmt.Fprintln(os.Stderr, "  factoryImageUrlOrFile     Remote URL or local file path of factory image")
 		fmt.Fprintln(os.Stderr, "  partitionFilename         Name of partition image to extract")
+		fmt.Fprintln(os.Stderr, "\nUse radio.img to extract radio-*.img with its original filename.")
 	case "passthrough-factory":
 		fmt.Fprintln(os.Stderr, "Usage: pluck passthrough-factory <factoryImageUrlOrFile> <partitionFilename> <subcommand> [arguments]")
 		fmt.Fprintln(os.Stderr, "\nPass partition image from factory image through to subcommand")
@@ -1571,6 +1583,7 @@ func showCommandUsage(command string) {
 		fmt.Fprintln(os.Stderr, "  factoryImageUrlOrFile     Remote URL or local file path of factory image")
 		fmt.Fprintln(os.Stderr, "  partitionFilename         Name of partition image to pass through")
 		fmt.Fprintln(os.Stderr, "  subcommand                Subcommand to handle partition image")
+		fmt.Fprintln(os.Stderr, "\nUse radio.img to select radio-*.img from the factory archive.")
 		fmt.Fprintln(os.Stderr, "\nSupported subcommands:")
 		fmt.Fprintln(os.Stderr, "  extract-erofs             Extract target file from erofs partition image")
 		fmt.Fprintln(os.Stderr, "  extract-bootloader        Extract partition image from bootloader image")
